@@ -137,7 +137,7 @@ class Translator:
         logging.info(f'Finished evaluation on test set')
 
         if self.distributed:
-            dist.broadcast(test_bleu, 0)
+            utils.broadcast(test_bleu, 0)
 
         if calc_bleu:
             eval_stats['bleu'] = test_bleu[0].item()

@@ -31,6 +31,12 @@ from collections import OrderedDict
 import dllogger
 import numpy as np
 
+import os
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
+
 
 def format_step(step):
     if isinstance(step, str):
@@ -207,7 +213,8 @@ class AverageMeter(object):
 
 
 class Logger(object):
-    def __init__(self, print_interval, backends, start_epoch=-1, verbose=False):
+    def __init__(self, print_interval, backends, start_epoch=-1, verbose=False, tb_dir=None, train_steps_per_epoch=0,
+                 val_steps_per_epoch=0):
         self.epoch = start_epoch
         self.iteration = -1
         self.val_iteration = -1
@@ -215,15 +222,21 @@ class Logger(object):
         self.backends = backends
         self.print_interval = print_interval
         self.verbose = verbose
+        self.tb_writer = None
+        if tb_dir is not None and SummaryWriter is not None:
+            os.makedirs(tb_dir, exist_ok=True)
+            self.tb_writer = SummaryWriter(tb_dir)
+        self.train_steps_per_epoch = train_steps_per_epoch
+        self.val_steps_per_epoch = val_steps_per_epoch
         dllogger.init(backends)
 
     def log_parameter(self, data, verbosity=0):
         dllogger.log(step="PARAMETER", data=data, verbosity=verbosity)
 
-    def register_metric(self, metric_name, meter, verbosity=0, metadata={}):
+    def register_metric(self, metric_name, meter, verbosity=0, metadata={}, tb=False):
         if self.verbose:
             print("Registering metric: {}".format(metric_name))
-        self.metrics[metric_name] = {"meter": meter, "level": verbosity}
+        self.metrics[metric_name] = {"meter": meter, "level": verbosity, "tb": tb}
         dllogger.metadata(metric_name, metadata)
 
     def log_metric(self, metric_name, val, n=1):
@@ -256,6 +269,12 @@ class Logger(object):
                     data={n: m["meter"].get_iteration() for n, m in llm.items()},
                     verbosity=ll,
                 )
+            if self.tb_writer:
+                steps_per_epoch = self.val_steps_per_epoch if val else self.train_steps_per_epoch
+                for n, m in metrics.items():
+                    if m["tb"]:
+                        self.tb_writer.add_scalar(n, m["meter"].get_iteration(),
+                                                  self.iteration + steps_per_epoch * self.epoch)
 
             for n, m in metrics.items():
                 m["meter"].reset_iteration()
@@ -281,6 +300,10 @@ class Logger(object):
                 step=(self.epoch,),
                 data={n: m["meter"].get_epoch() for n, m in llm.items()},
             )
+        if self.tb_writer:
+            for n, m in self.metrics.items():
+                if m["tb"]:
+                    self.tb_writer.add_scalar("epoch." + n, m["meter"].get_epoch(), self.epoch)
 
     def end(self):
         for n, m in self.metrics.items():

@@ -19,10 +19,12 @@ set -x
 
 ls -ltrash
 
-download_dir=${download_dir:-'/data/dlrm/criteo'}
+#download_dir=${download_dir:-'/data/dlrm/criteo'}
+download_dir='~/Datasets/criteo'
 ./verify_criteo_downloaded.sh ${download_dir}
 
-spark_output_path=${spark_output_path:-'/data/dlrm/spark/output'}
+#spark_output_path=${spark_output_path:-'/data/dlrm/spark/output'}
+spark_output_path='./dlrm/spark/output'
 
 
 if [ -f ${spark_output_path}/train/_SUCCESS ] \

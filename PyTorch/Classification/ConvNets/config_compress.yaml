@@ -1,0 +1,7 @@
+ignore_modules:
+  - bn
+  - bias
+
+#modules:
+#  - name: fc
+#    quantization_bits: 2

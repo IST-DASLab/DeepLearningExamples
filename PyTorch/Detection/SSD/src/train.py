@@ -18,6 +18,7 @@ import time
 from SSD import _C as C
 
 from apex import amp
+import horovod.torch as hvd
 
 def train_loop(model, loss_func, epoch, optim, train_dataloader, val_dataloader, encoder, iteration, logger, args, mean, std):
 #     for nbatch, (img, _, img_size, bbox, label) in enumerate(train_dataloader):
@@ -65,8 +66,15 @@ def train_loop(model, loss_func, epoch, optim, train_dataloader, val_dataloader,
         if args.amp:
             with amp.scale_loss(loss, optim) as scale_loss:
                 scale_loss.backward()
+                if args.hvd:
+                    optim.synchronize()
         else:
             loss.backward()
+        if args.hvd:
+            with optim.skip_synchronize():
+                optim.step()
+        else:
+            optim.step()
 
         if args.warmup is not None:
             warmup(optim, args.warmup, iteration, args.learning_rate)
@@ -134,10 +142,15 @@ def benchmark_train_loop(model, loss_func, epoch, optim, train_dataloader, val_d
         if args.amp:
             with amp.scale_loss(loss, optim) as scale_loss:
                 scale_loss.backward()
+                if args.hvd:
+                    optim.synchronize()
         else:
             loss.backward()
-
-        optim.step()
+        if args.hvd:
+            with optim.skip_synchronize():
+                optim.step()
+        else:
+            optim.step()
         optim.zero_grad()
 
         if i >= args.benchmark_warmup + args.benchmark_iterations:
@@ -147,11 +160,15 @@ def benchmark_train_loop(model, loss_func, epoch, optim, train_dataloader, val_d
             logger.update(args.batch_size, time.time() - start_time)
 
 
-    result.data[0] = logger.print_result()
+    result.data[0] = logger.print_result(args.rank == 0)
     if args.N_gpu > 1:
-        torch.distributed.reduce(result, 0)
+        if args.distributed:
+            torch.distributed.reduce(result, 0)
+        else:
+            result = hvd.allgather(result)
+            result = torch.sum(result)
     if args.local_rank == 0:
-        print('Training performance = {} FPS'.format(float(result.data[0])))
+        print('Training performance = {} FPS'.format(float(result.item())))
 
 
 
@@ -192,8 +209,8 @@ def benchmark_inference_loop(model, loss_func, epoch, optim, train_dataloader, v
 
             if i >= args.benchmark_warmup:
                 logger.update(args.eval_batch_size, time.time() - start_time)
-
-    logger.print_result()
+    if args.local_rank == 0:
+        logger.print_result()
 
 def warmup(optim, warmup_iters, iteration, base_lr):
     if iteration < warmup_iters:

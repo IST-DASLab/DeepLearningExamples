@@ -37,9 +37,16 @@ from . import logger as log
 from . import resnet as models
 from . import utils
 import dllogger
+import horovod.torch as hvd
+import json
+
+import sys
+sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..')))
+import Common.compressors as compressors
 
 try:
-    from apex.parallel import DistributedDataParallel as DDP
+    # from apex.parallel import DistributedDataParallel as DDP
+    from torch.nn.parallel import DistributedDataParallel as DDP
     from apex.fp16_utils import *
     from apex import amp
 except ImportError:
@@ -55,13 +62,13 @@ LOSS_METADATA = {"format": ":.5f"}
 
 class ModelAndLoss(nn.Module):
     def __init__(
-        self,
-        arch,
-        loss,
-        pretrained_weights=None,
-        cuda=True,
-        fp16=False,
-        memory_format=torch.contiguous_format,
+            self,
+            arch,
+            loss,
+            pretrained_weights=None,
+            cuda=True,
+            fp16=False,
+            memory_format=torch.contiguous_format,
     ):
         super(ModelAndLoss, self).__init__()
         self.arch = arch
@@ -73,7 +80,7 @@ class ModelAndLoss(nn.Module):
             model.load_state_dict(pretrained_weights)
 
         if cuda:
-            model = model.cuda().to(memory_format=memory_format)
+            model = model.cuda() #.to(memory_format=memory_format)
         if fp16:
             model = network_to_half(model)
 
@@ -92,8 +99,15 @@ class ModelAndLoss(nn.Module):
 
         return loss, output
 
-    def distributed(self):
-        self.model = DDP(self.model)
+    def distributed(self, fake_comp_ratio=1.0, num_allreduce_streams=1, hvd_dist=False):
+        # self.model = DDP(self.model)
+        rank = torch.distributed.get_rank()
+        self.model = DDP(self.model, device_ids=[rank], output_device=rank)
+
+    # def distributed(self, fake_comp_ratio=1.0, num_allreduce_streams=1, hvd_dist=False):
+    #     self.model = DDP(self.model, fake_comp_ratio=fake_comp_ratio, num_allreduce_streams=num_allreduce_streams,
+    #                      hvd_dist=hvd_dist, allreduce_always_fp32=True)
+    #     # self.model = DDP(self.model, hvd_dist=hvd_dist, allreduce_always_fp32=True)
 
     def load_model_state(self, state):
         if not state is None:
@@ -101,18 +115,17 @@ class ModelAndLoss(nn.Module):
 
 
 def get_optimizer(
-    parameters,
-    fp16,
-    lr,
-    momentum,
-    weight_decay,
-    nesterov=False,
-    state=None,
-    static_loss_scale=1.0,
-    dynamic_loss_scale=False,
-    bn_weight_decay=False,
+        parameters,
+        fp16,
+        lr,
+        momentum,
+        weight_decay,
+        nesterov=False,
+        state=None,
+        static_loss_scale=1.0,
+        dynamic_loss_scale=False,
+        bn_weight_decay=False,
 ):
-
     if bn_weight_decay:
         print(" ! Weight decay applied to BN parameters ")
         optimizer = torch.optim.SGD(
@@ -145,7 +158,6 @@ def get_optimizer(
             dynamic_loss_scale=dynamic_loss_scale,
             verbose=False,
         )
-
     if not state is None:
         optimizer.load_state_dict(state)
 
@@ -227,9 +239,11 @@ def lr_exponential_policy(
 
 
 def get_train_step(
-    model_and_loss, optimizer, fp16, use_amp=False, batch_size_multiplier=1
+        model_and_loss, optimizer, fp16, use_amp=False, batch_size_multiplier=1
 ):
+    hvd_enabled = utils.horovod_enabled()
     def _step(input, target, optimizer_step=True):
+        # optimizer.zero_grad()
         input_var = Variable(input)
         target_var = Variable(target)
         loss, output = model_and_loss(input_var, target_var)
@@ -243,6 +257,8 @@ def get_train_step(
         elif use_amp:
             with amp.scale_loss(loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
+                if hvd_enabled:
+                    optimizer.synchronize()
         else:
             loss.backward()
 
@@ -254,9 +270,14 @@ def get_train_step(
             )
             for param_group in opt.param_groups:
                 for param in param_group["params"]:
-                    param.grad /= batch_size_multiplier
+                    if param.requires_grad:
+                        param.grad /= batch_size_multiplier
 
-            optimizer.step()
+            if use_amp and hvd_enabled:
+                with optimizer.skip_synchronize():
+                    optimizer.step()
+            else:
+                optimizer.step()
             optimizer.zero_grad()
 
         torch.cuda.synchronize()
@@ -267,25 +288,25 @@ def get_train_step(
 
 
 def train(
-    train_loader,
-    model_and_loss,
-    optimizer,
-    lr_scheduler,
-    fp16,
-    logger,
-    epoch,
-    use_amp=False,
-    prof=-1,
-    batch_size_multiplier=1,
-    register_metrics=True,
+        train_loader,
+        model_and_loss,
+        optimizer,
+        lr_scheduler,
+        fp16,
+        logger,
+        epoch,
+        use_amp=False,
+        prof=-1,
+        batch_size_multiplier=1,
+        register_metrics=True,
 ):
-
     if register_metrics and logger is not None:
         logger.register_metric(
             "train.loss",
             log.LOSS_METER(),
             verbosity=dllogger.Verbosity.DEFAULT,
             metadata=LOSS_METADATA,
+            tb=True,
         )
         logger.register_metric(
             "train.compute_ips",
@@ -298,17 +319,18 @@ def train(
             log.PERF_METER(),
             verbosity=dllogger.Verbosity.DEFAULT,
             metadata=IPS_METADATA,
+            tb=True,
         )
         logger.register_metric(
             "train.data_time",
             log.PERF_METER(),
-            verbosity=dllogger.Verbosity.VERBOSE,
+            verbosity=dllogger.Verbosity.DEFAULT,
             metadata=TIME_METADATA,
         )
         logger.register_metric(
             "train.compute_time",
             log.PERF_METER(),
-            verbosity=dllogger.Verbosity.VERBOSE,
+            verbosity=dllogger.Verbosity.DEFAULT,
             metadata=TIME_METADATA,
         )
 
@@ -324,18 +346,22 @@ def train(
     end = time.time()
 
     optimizer.zero_grad()
-
+    hvd_enabled = utils.horovod_enabled()
     data_iter = enumerate(train_loader)
     if logger is not None:
         data_iter = logger.iteration_generator_wrapper(data_iter)
     if prof > 0:
         data_iter = utils.first_n(prof, data_iter)
-
     for i, (input, target) in data_iter:
         bs = input.size(0)
         lr_scheduler(optimizer, i, epoch)
+        if hvd_enabled:
+            torch.cuda.synchronize()
+            # hvd.allreduce(torch.tensor([0], dtype=torch.int32, device=input.device), name="barrier")
+        elif torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.cuda.synchronize()
+            # torch.distributed.barrier()
         data_time = time.time() - end
-
         optimizer_step = ((i + 1) % batch_size_multiplier) == 0
         loss = step(input, target, optimizer_step=optimizer_step)
 
@@ -361,7 +387,7 @@ def get_val_step(model_and_loss):
 
         prec1, prec5 = utils.accuracy(output.data, target, topk=(1, 5))
 
-        if torch.distributed.is_initialized():
+        if torch.distributed.is_initialized() or utils.horovod_enabled():
             reduced_loss = utils.reduce_tensor(loss.data)
             prec1 = utils.reduce_tensor(prec1)
             prec5 = utils.reduce_tensor(prec5)
@@ -376,7 +402,7 @@ def get_val_step(model_and_loss):
 
 
 def validate(
-    val_loader, model_and_loss, fp16, logger, epoch, prof=-1, register_metrics=True
+        val_loader, model_and_loss, fp16, logger, epoch, prof=-1, register_metrics=True
 ):
     if register_metrics and logger is not None:
         logger.register_metric(
@@ -384,6 +410,7 @@ def validate(
             log.ACC_METER(),
             verbosity=dllogger.Verbosity.DEFAULT,
             metadata=ACC_METADATA,
+            tb=True,
         )
         logger.register_metric(
             "val.top5",
@@ -396,6 +423,7 @@ def validate(
             log.LOSS_METER(),
             verbosity=dllogger.Verbosity.DEFAULT,
             metadata=LOSS_METADATA,
+            tb=True,
         )
         logger.register_metric(
             "val.compute_ips",
@@ -439,7 +467,6 @@ def validate(
             verbosity=dllogger.Verbosity.VERBOSE,
             metadata=TIME_METADATA,
         )
-
     step = get_val_step(model_and_loss)
 
     top1 = log.AverageMeter()
@@ -459,7 +486,6 @@ def validate(
         data_time = time.time() - end
 
         loss, prec1, prec5 = step(input, target)
-
         it_time = time.time() - end
 
         top1.record(to_python_float(prec1), bs)
@@ -482,41 +508,59 @@ def validate(
 
 # Train loop {{{
 def calc_ips(batch_size, time):
-    world_size = (
-        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    )
+    if torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+    elif utils.horovod_enabled():
+        world_size = hvd.size()
+    else:
+        world_size = 1
     tbs = world_size * batch_size
     return tbs / time
 
 
 def train_loop(
-    model_and_loss,
-    optimizer,
-    lr_scheduler,
-    train_loader,
-    val_loader,
-    fp16,
-    logger,
-    should_backup_checkpoint,
-    use_amp=False,
-    batch_size_multiplier=1,
-    best_prec1=0,
-    start_epoch=0,
-    end_epoch=0,
-    prof=-1,
-    skip_training=False,
-    skip_validation=False,
-    save_checkpoints=True,
-    checkpoint_dir="./",
-    checkpoint_filename="checkpoint.pth.tar",
+        model_and_loss,
+        optimizer,
+        lr_scheduler,
+        train_loader,
+        val_loader,
+        fp16,
+        logger,
+        should_backup_checkpoint,
+        use_amp=False,
+        batch_size_multiplier=1,
+        best_prec1=0,
+        start_epoch=0,
+        end_epoch=0,
+        prof=-1,
+        skip_training=False,
+        skip_validation=False,
+        save_checkpoints=True,
+        checkpoint_dir="./",
+        checkpoint_filename="checkpoint.pth.tar",
+        bb_settings=None,
+        compression=None
 ):
-
     prec1 = -1
+    root = False
+    try:
+        if hvd.rank() == 0:
+            root = True
+    except:
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            root = True
 
     print(f"RUNNING EPOCHS FROM {start_epoch} TO {end_epoch}")
     for epoch in range(start_epoch, end_epoch):
+        # if bb_settings is not None:
+        #     assert hvd_enabled
+        #     optimizer = hvd.BrokenBarrier(model_and_loss.model, orig_optimizer, named_parameters=model_and_loss.model.named_parameters(), **bb_settings)
+        #     hvd.broadcast_parameters(model_and_loss.model.state_dict(), root_rank=0)
+        #     hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
         if logger is not None:
             logger.start_epoch()
+        end = time.time()
         if not skip_training:
             train(
                 train_loader,
@@ -531,7 +575,8 @@ def train_loop(
                 register_metrics=epoch == start_epoch,
                 batch_size_multiplier=batch_size_multiplier,
             )
-
+        if root:
+            print("Time per epoch: ", time.time() - end)
         if not skip_validation:
             prec1, nimg = validate(
                 val_loader,
@@ -544,10 +589,18 @@ def train_loop(
             )
         if logger is not None:
             logger.end_epoch()
+        if issubclass(type(compression), compressors.Quantizer):
+            d, sum = compression.get_ef_magnitudes()
+            if d:
+                directory = os.path.join(checkpoint_dir, "bits-{}".format(compression.bits))
+                os.makedirs(directory, exist_ok=True)
+                file = "epoch{}.json".format(epoch)
+                if root:
+                    with open(os.path.join(directory, file), 'w') as f:
+                        # d = {k: v / sum for k,v in d.items()}
+                        json.dump(d, f)
 
-        if save_checkpoints and (
-            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-        ):
+        if save_checkpoints and root:
             if not skip_validation:
                 is_best = logger.metrics["val.top1"]["meter"].get_epoch() > best_prec1
                 best_prec1 = max(
@@ -574,6 +627,5 @@ def train_loop(
                 backup_filename=backup_filename,
                 filename=checkpoint_filename,
             )
-
 
 # }}}

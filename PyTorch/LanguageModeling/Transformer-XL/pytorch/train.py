@@ -46,6 +46,10 @@ from utils.exp_utils import l2_promote
 from utils.exp_utils import log_env_info
 from utils.exp_utils import register_ignoring_timeout_handler
 
+import horovod.torch as hvd
+# import powersgd
+# sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..', '..')))
+# from Common.compressors import compressors
 
 def parse_args():
     parent_parser = argparse.ArgumentParser(
@@ -235,6 +239,27 @@ def parse_args():
     dist.add_argument('--local_rank',  type=int,
                       default=os.getenv('LOCAL_RANK', 0),
                       help='Used for multi-process training.')
+    parser.add_argument('--hvd', action='store_true',
+                        help='Run using horovod')
+    # parser.add_argument("--compression-type", type=str, default="none", choices=compression_types,
+    #                     help="Compression Type (default: none)")
+    parser.add_argument("--quantization-bits", type=int, default=4,
+                        help="Quantization bits (default: 4)")
+    parser.add_argument("--bucket-size", type=int, default=512,
+                        help="Quantization bucket size (default: 512)")
+    parser.add_argument('--error-feedback', action='store_true', default=False,
+                        help='enable error correction')
+    parser.add_argument("--efx-bits", type=int, default=None,
+                        help="Quantization bits of error feedback (default - no efx)")
+    parser.add_argument('--topk-ratio', type=float, default=0.01,
+                        help='topK selecting ratio (default: 0.01)')
+    parser.add_argument('--big-grad', action='store_true', default=False,
+                        help='stack all gradients into signle tensor before compression and allreduce')
+    parser.add_argument("--compressor-warmup-steps", type=int, default=0,
+                        help="Warm up period for compressor")
+    parser.add_argument('--powersgd-reducer', type=str, choices=powersgd.supported_reducers, default='none',
+                        help="Reducer from powersgd repo")
+    parser.add_argument('--optimizer-reducer-rank', type=int, default=4, help="Powersgd rank")
 
     parser.set_defaults(**config)
     args, _ = parser.parse_known_args()
@@ -442,16 +467,17 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
 
         data_chunks = torch.chunk(data, args.batch_chunk, 1)
         target_chunks = torch.chunk(target, args.batch_chunk, 1)
-
         for i in range(args.batch_chunk):
             data_i = data_chunks[i].contiguous()
             target_i = target_chunks[i].contiguous()
             loss, mems[i] = para_model(data_i, target_i, mems[i])
             loss = loss.float().mean().type_as(loss) / args.batch_chunk
-
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
+                    # if args.hvd and i == args.batch_chunk - 1:
+                    if args.hvd:
+                        optimizer.synchronize()
             else:
                 loss.backward()
 
@@ -461,8 +487,12 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
             torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-
-        optimizer.step()
+        if args.hvd and args.fp16:
+            with optimizer.skip_synchronize():
+                optimizer.step()
+            # optimizer.step()
+        else:
+            optimizer.step()
         if optimizer_sparse:
             optimizer_sparse.step()
 
@@ -530,8 +560,9 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
                 log_str += ' | ppl {:9.2f}'.format(math.exp(cur_loss))
                 dllogger_data['train_perplexity'] = math.exp(cur_loss)
 
-            logging.info(log_str)
-            dllogger.log(step=tuple([train_step]), data=dllogger_data)
+            if args.local_rank == 0:
+                logging.info(log_str)
+                dllogger.log(step=tuple([train_step]), data=dllogger_data)
 
         do_periodic_eval = train_step % args.eval_interval == 0
         is_final_step = train_step == args.max_step
@@ -562,9 +593,10 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
             else:
                 log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
                 dllogger_data['valid_perplexity'] = math.exp(val_loss)
-            logging.info(log_str)
-            logging.info('-' * 100)
-            dllogger.log(step=tuple([train_step]), data=dllogger_data)
+            if args.local_rank == 0:
+                logging.info(log_str)
+                logging.info('-' * 100)
+                dllogger.log(step=tuple([train_step]), data=dllogger_data)
 
             last_iter = tr_iter.last_iter
 
@@ -600,8 +632,10 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
 
 def main():
     args = parse_args()
+    if args.hvd:
+        utils.distributed.init_hvd()
+        args.local_rank = utils.distributed.get_rank()
     utils.gpu_affinity.set_affinity(args.local_rank)
-
     # Initialize device and distributed backend
     torch.cuda.set_device(args.local_rank)
     l2_promote()
@@ -613,7 +647,6 @@ def main():
                                                         args.append_dataset,
                                                         args.append_time,
                                                         )
-
     with utils.distributed.sync_workers() as rank:
         if rank == 0:
             create_exp_dir(args.work_dir,
@@ -724,7 +757,6 @@ def main():
     model.apply(functools.partial(weights_init, args=args))
     # ensure embedding init is not overridden by out_layer in case of weight sharing
     model.word_emb.apply(functools.partial(weights_init, args=args))
-
     args.n_all_param = sum([p.nelement() for p in model.parameters()])
     args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
 
@@ -769,8 +801,21 @@ def main():
         optimizer = lamb.JITLamb(model.parameters(), lr=args.lr,
                                  weight_decay=args.weight_decay)
         optimizer_sparse = None
-
     model = model.to(device)
+
+    if args.hvd and args.multi_gpu == 'ddp':
+        compression = hvd.Compression.none
+        # compression = compressors.get_compressor(args, model.named_parameters())
+        # compression = hvd.Compression.fp32
+        if not args.big_grad:
+            optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), op=hvd.Average,
+                                                 compression=compression, backward_passes_per_step=args.batch_chunk)
+            # optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), op=hvd.Average,
+            #                                      compression=compression)
+        else:
+            optimizer = CompressedSGDBig(optimizer, compression)
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+        hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
     if args.fp16:
         model, optimizer = amp.initialize(
@@ -874,7 +919,6 @@ def main():
                             f'this run was scheduled for a total of '
                             f'{args.max_step} steps, exiting')
                 sys.exit(1)
-
             model.apply(functools.partial(update_dropout, args=args))
             model.apply(functools.partial(update_dropatt, args=args))
         except FileNotFoundError:
@@ -949,7 +993,8 @@ def main():
         else:
             summary['test_perplexity'] = math.exp(test_loss)
 
-    logging.info(f'Training time: {(elapsed / 60):.2f} minutes')
+    # logging.info(f'Training time: {(elapsed / 60):.2f} minutes')
+    logging.info(f'Training time: {elapsed:.2f} seconds')
     logging.info(f'Training throughput: {meters["train_throughput"].avg:.2f} tok/s')
 
     if best_val_loss:

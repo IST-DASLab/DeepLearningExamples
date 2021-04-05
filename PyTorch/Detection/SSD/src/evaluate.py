@@ -19,13 +19,10 @@ from contextlib import redirect_stdout
 import io
 
 from pycocotools.cocoeval import COCOeval
-
+import horovod.torch as hvd
 
 def evaluate(model, coco, cocoGt, encoder, inv_map, args):
-    if args.distributed:
-        N_gpu = torch.distributed.get_world_size()
-    else:
-        N_gpu = 1
+    N_gpu = args.N_gpu
 
     model.eval()
     if not args.no_cuda:
@@ -75,14 +72,17 @@ def evaluate(model, coco, cocoGt, encoder, inv_map, args):
     ret = np.array(ret).astype(np.float32)
 
     # Multi-GPU eval
-    if args.distributed:
+    if args.distributed or args.hvd:
         # NCCL backend means we can only operate on GPU tensors
         ret_copy = torch.tensor(ret).cuda()
         # Everyone exchanges the size of their results
         ret_sizes = [torch.tensor(0).cuda() for _ in range(N_gpu)]
 
         torch.cuda.synchronize()
-        torch.distributed.all_gather(ret_sizes, torch.tensor(ret_copy.shape[0]).cuda())
+        if args.distributed:
+            torch.distributed.all_gather(ret_sizes, torch.tensor(ret_copy.shape[0]).cuda())
+        else:
+            ret_sizes = hvd.allgather(torch.tensor(ret_copy.shape[0]).cuda())
         torch.cuda.synchronize()
 
         # Get the maximum results size, as all tensors must be the same shape for
@@ -101,7 +101,10 @@ def evaluate(model, coco, cocoGt, encoder, inv_map, args):
         # Everyone exchanges (padded) results
 
         torch.cuda.synchronize()
-        torch.distributed.all_gather(other_ret, ret_pad)
+        if args.distributed:
+            torch.distributed.all_gather(other_ret, ret_pad)
+        else:
+            other_ret = hvd.allgather(ret_pad)
         torch.cuda.synchronize()
 
         # Now need to reconstruct the _actual_ results from the padded set using slices.

@@ -221,4 +221,4 @@ def l2_promote():
     pValue = ctypes.cast((ctypes.c_int*1)(), ctypes.POINTER(ctypes.c_int))
     _libcudart.cudaDeviceSetLimit(ctypes.c_int(0x05), ctypes.c_int(128))
     _libcudart.cudaDeviceGetLimit(pValue, ctypes.c_int(0x05))
-    assert pValue.contents.value == 128
+    assert pValue.contents.value == 128, "Wrong value {}".format(pValue.contents.value)

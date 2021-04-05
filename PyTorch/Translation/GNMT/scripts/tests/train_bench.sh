@@ -23,8 +23,8 @@
 
 set -e
 
-DATASET_DIR='data/wmt16_de_en'
-REPO_DIR='/workspace/gnmt'
+DATASET_DIR='/home/imarkov/Datasets/wmt16_de_en'
+REPO_DIR='./'
 REFERENCE_FILE=$REPO_DIR/scripts/tests/reference_training_performance
 
 MATH=$1
@@ -41,7 +41,12 @@ GPU_COUNT=`nvidia-smi --query-gpu=gpu_name --format=csv,noheader |wc -l`
 echo 'GPU_COUNT:' ${GPU_COUNT}
 
 if [[ ${GPU_COUNT} -eq 1 || ${GPU_COUNT} -eq 2 || ${GPU_COUNT} -eq 4 || ${GPU_COUNT} -eq 8 ]]; then
-   GLOBAL_BATCH_SIZE=1024
+   if [[ ${MATH} == "fp32" ]]; then
+        BATCH_SIZE=64
+   else
+        BATCH_SIZE=128
+   fi
+   GLOBAL_BATCH_SIZE=$((BATCH_SIZE * GPU_COUNT))
 elif [ ${GPU_COUNT} -eq 16 ]; then
    GLOBAL_BATCH_SIZE=2048
 else
@@ -61,7 +66,6 @@ else
 fi
 
 cd $REPO_DIR
-
 python3 -m launch train.py \
    --dataset-dir $DATASET_DIR \
    --seed 1 \
@@ -71,4 +75,6 @@ python3 -m launch train.py \
    --train-max-size $((128 * ${GPU_COUNT} * 300)) \
    --math ${MATH} \
    --train-global-batch-size ${GLOBAL_BATCH_SIZE} \
+   --train-batch-size $BATCH_SIZE \
+   --prof-start 50 --prof-steps 50 \
    ${TARGET_PERF}

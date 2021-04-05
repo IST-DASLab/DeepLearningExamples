@@ -45,6 +45,7 @@ from seq2seq.models.gnmt import GNMT
 from seq2seq.train.smoothing import LabelSmoothing
 from seq2seq.train.table import TrainingTable
 
+import horovod.torch as hvd
 
 def parse_args():
     """
@@ -301,6 +302,10 @@ def parse_args():
                            per second)')
     benchmark.add_argument('--target-bleu', default=None, type=float,
                            help='target accuracy')
+    benchmark.add_argument('--prof-start', default=-1, type=int,
+                           help='Warmup number of steps before starting profiling')
+    benchmark.add_argument('--prof-steps', default=50, type=int,
+                           help='Warmup number of steps before starting profiling')
 
     # distributed
     distributed = parser.add_argument_group('distributed setup')
@@ -308,6 +313,8 @@ def parse_args():
                              help='global rank of the process, do not set!')
     distributed.add_argument('--local_rank', default=0, type=int,
                              help='local rank of the process, do not set!')
+    distributed.add_argument(
+        "--hvd", action="store_true", help="use horovod")
 
     args = parser.parse_args()
 
@@ -366,8 +373,10 @@ def main():
     """
     training_start = time.time()
     args = parse_args()
+    utils.init_distributed(args.cuda, args.hvd)
+    if args.hvd:
+        args.local_rank = hvd.local_rank()
     device = utils.set_device(args.cuda, args.local_rank)
-    utils.init_distributed(args.cuda)
     args.rank = utils.get_rank()
 
     if not args.cudnn:
@@ -527,6 +536,9 @@ def main():
         intra_epoch_eval=args.intra_epoch_eval,
         translator=translator,
         prealloc_mode=args.prealloc_mode,
+        prof_start=args.prof_start,
+        prof_steps=args.prof_steps,
+        hvd_dist=args.hvd
         )
 
     trainer = trainers.Seq2SeqTrainer(**trainer_options)

@@ -31,9 +31,12 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
+import torchvision.models as tmodels
 
 __all__ = ["ResNet", "build_resnet", "resnet_versions", "resnet_configs"]
 
+wide_resnets = ["wide_resnet50", "wide_resnet101"]
+others = ["vgg16"]
 # ResNetBuilder {{{
 
 
@@ -385,6 +388,20 @@ resnet_versions = {
 
 
 def build_resnet(version, config, num_classes, verbose=True):
+    if version in wide_resnets:
+        model = getattr(tmodels, version + "_2")()
+        return model
+    if version == "resnet18_convex":
+        model = tmodels.resnet18(pretrained=True)
+        for n, p in model.named_parameters():
+            if "fc" not in n:
+                p.requires_grad = False
+        torch.nn.init.uniform_(model.fc.weight)
+        torch.nn.init.zeros_(model.fc.bias)
+        return model
+    if version in others:
+        model = getattr(tmodels, version)()
+        return model
     version = resnet_versions[version]
     config = resnet_configs[config]
 

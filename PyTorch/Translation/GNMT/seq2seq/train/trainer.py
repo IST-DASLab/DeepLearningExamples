@@ -62,7 +62,10 @@ class Seq2SeqTrainer:
                  prealloc_mode='always',
                  iter_size=1,
                  translator=None,
-                 verbose=False):
+                 verbose=False,
+                 prof_start=-1,
+                 prof_steps=20,
+                 hvd_dist=False):
         """
         Constructor for the Seq2SeqTrainer.
 
@@ -109,10 +112,12 @@ class Seq2SeqTrainer:
         self.iter_size = iter_size
         self.prealloc_mode = prealloc_mode
         self.preallocated = False
-
         self.distributed = torch.distributed.is_initialized()
+        self.hvd_dist = hvd_dist
         self.batch_first = model.batch_first
-
+        self.prof_start = prof_start
+        self.prof_steps = prof_steps
+        self.prof = self.prof_start > 0
         params = self.model.parameters()
 
         if math == 'manual_fp16':
@@ -147,8 +152,9 @@ class Seq2SeqTrainer:
                 dls_upscale_interval=loss_scaling['upscale_interval']
                 )
 
-        if self.distributed:
-            self.model = DistributedDataParallel(self.model)
+        if self.distributed or self.hvd_dist:
+            self.model = DistributedDataParallel(self.model, fake_comp_ratio=1.0, hvd_dist=self.hvd_dist,
+                                                 allreduce_always_fp32=True)
 
     def iterate(self, src, tgt, update=True, training=True):
         """
@@ -168,6 +174,7 @@ class Seq2SeqTrainer:
         num_toks = {}
         num_toks['tgt'] = int(sum(tgt_length - 1))
         num_toks['src'] = int(sum(src_length))
+        if self.prof: torch.cuda.nvtx.range_push("forward")
 
         if self.batch_first:
             output = self.model(src, src_length, tgt[:, :-1])
@@ -180,13 +187,14 @@ class Seq2SeqTrainer:
 
         loss = self.criterion(output.view(T * B, -1),
                               tgt_labels.contiguous().view(-1))
+        if self.prof: torch.cuda.nvtx.range_pop()
 
         loss_per_batch = loss.item()
         loss /= (B * self.iter_size)
 
         if training:
             self.fp_optimizer.step(loss, self.optimizer, self.scheduler,
-                                   update)
+                                   update, prof=True)
 
         loss_per_token = loss_per_batch / num_toks['tgt']
         loss_per_sentence = loss_per_batch / B
@@ -220,10 +228,25 @@ class Seq2SeqTrainer:
         batch_size = data_loader.batch_size
 
         end = time.time()
-        for i, (src, tgt) in enumerate(data_loader):
+        data_loader_iter = iter(data_loader)
+        i = 1
+        while True:
+            if i == self.prof_start:
+                logging.info("Profiling begun at iteration {}".format(i))
+                torch.cuda.cudart().cudaProfilerStart()
+                if self.distributed:
+                    self.model.set_prof(True)
+            if self.prof: torch.cuda.nvtx.range_push("Body of iteration {}".format(i))
+
+            if self.prof: torch.cuda.nvtx.range_push("data load")
+            try:
+                src, tgt = next(data_loader_iter)
+            except StopIteration:
+                break
             self.save_counter += 1
             # measure data loading time
             data_time.update(time.time() - end)
+            if self.prof: torch.cuda.nvtx.range_pop()
 
             update = False
             if i % self.iter_size == self.iter_size - 1:
@@ -245,8 +268,13 @@ class Seq2SeqTrainer:
             tot_num_toks = num_toks['tgt'] + num_toks['src']
             tot_tok_time.update(tot_num_toks / elapsed)
             self.loss = losses_per_token.avg
+            if self.prof: torch.cuda.nvtx.range_pop()
+            if self.prof and i == self.prof_start + self.prof_steps:
+                logging.info("Profiling ended at iteration {}".format(i))
+                torch.cuda.cudart().cudaProfilerStop()
+                break
 
-            if training and i in eval_iters:
+            if training and not self.prof and i in eval_iters:
                 eval_fname = f'eval_epoch_{self.epoch}_iter_{i}'
                 eval_path = os.path.join(self.save_dir, eval_fname)
                 _, eval_stats = self.translator.run(
@@ -294,9 +322,9 @@ class Seq2SeqTrainer:
                     with sync_workers() as rank:
                         if rank == 0:
                             self.save(identifier=identifier)
-
+            i += 1
             end = time.time()
-
+        print(tot_tok_time.avg)
         tot_tok_time.reduce('sum')
         losses_per_token.reduce('mean')
 

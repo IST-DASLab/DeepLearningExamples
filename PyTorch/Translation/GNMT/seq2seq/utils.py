@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.init as init
 import torch.utils.collect_env
-
+import horovod.torch as hvd
 
 def init_lstm_(lstm, init_weight=0.1):
     """
@@ -144,7 +144,7 @@ def get_rank():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         rank = torch.distributed.get_rank()
     else:
-        rank = 0
+        rank = hvd.rank()
     return rank
 
 
@@ -156,8 +156,15 @@ def get_world_size():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         world_size = torch.distributed.get_world_size()
     else:
-        world_size = 1
+        world_size = hvd.size()
     return world_size
+
+def broadcast(tensor, rank):
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.broadcast(tensor, rank)
+    else:
+        hvd.broadcast(tensor, rank)
+
 
 
 @contextmanager
@@ -235,21 +242,25 @@ def set_device(cuda, local_rank):
     return device
 
 
-def init_distributed(cuda):
+def init_distributed(cuda, hvd_enabled):
     """
     Initializes distributed backend.
 
     :param cuda: (bool) if True initializes nccl backend, if False initializes
         gloo backend
     """
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    distributed = (world_size > 1)
-    if distributed:
-        backend = 'nccl' if cuda else 'gloo'
-        dist.init_process_group(backend=backend,
-                                init_method='env://')
-        assert dist.is_initialized()
-    return distributed
+    if not hvd_enabled:
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+        distributed = (world_size > 1)
+        if distributed:
+            backend = 'nccl' if cuda else 'gloo'
+            dist.init_process_group(backend=backend,
+                                    init_method='env://')
+            assert dist.is_initialized()
+        return distributed
+    else:
+        hvd.init()
+        return hvd.size() > 1
 
 
 def log_env_info():
@@ -340,11 +351,17 @@ class AverageMeter:
         """
         if op not in ('sum', 'mean'):
             raise NotImplementedError
-
+        try:
+            hvd_enabled = hvd.size() > 1
+        except ValueError:
+            hvd_enabled = False
         distributed = (get_world_size() > 1)
         if distributed:
-            backend = dist.get_backend()
-            cuda = (backend == dist.Backend.NCCL)
+            if not hvd_enabled:
+                backend = dist.get_backend()
+                cuda = (backend == dist.Backend.NCCL)
+            else:
+                cuda = True
 
             if cuda:
                 avg = torch.cuda.FloatTensor([self.avg])
@@ -352,9 +369,12 @@ class AverageMeter:
             else:
                 avg = torch.FloatTensor([self.avg])
                 _sum = torch.FloatTensor([self.sum])
-
-            dist.all_reduce(avg)
-            dist.all_reduce(_sum)
+            if not hvd_enabled:
+                dist.all_reduce(avg)
+                dist.all_reduce(_sum)
+            else:
+                avg = hvd.allreduce(avg, op=hvd.Sum)
+                _sum = hvd.allreduce(_sum, op=hvd.Sum)
             self.avg = avg.item()
             self.sum = _sum.item()
 

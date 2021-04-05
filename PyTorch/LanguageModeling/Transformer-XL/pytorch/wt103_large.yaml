@@ -1,7 +1,9 @@
 # Base
 wt103: &wt103
    dataset: wt103
-   data: ../data/wikitext-103/
+   data: /home/imarkov/Datasets/transformer_data/wikitext-103/
+   #   data: /datasets/transformer-data/wikitext-103/
+
 
 train: &train
    <<: *wt103
@@ -24,12 +26,14 @@ train: &train
    init_std: 0.005
    eval_tgt_len: 128
    batch_size: 128
+   local_batch_size: 16
    multi_gpu: ddp
    log_interval: 100
    eval_interval: 5000
    vocab: word
    adaptive: true
    div_val: 4
+   fp16: true
 
 train_multinode: &train_multinode
    <<: *wt103

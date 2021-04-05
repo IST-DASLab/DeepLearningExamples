@@ -14,6 +14,11 @@
 
 import math
 import numpy as np
+import os
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 
 class EpochMeter:
@@ -53,22 +58,33 @@ class IterationAverageMeter:
 
 
 class Logger:
-    def __init__(self, name, print_freq=20):
+    def __init__(self, name, print_freq=20, tb_dir=None):
         self.name = name
         self.train_loss_logger = IterationAverageMeter("Training loss")
         self.train_epoch_time_logger = EpochMeter("Training 1 epoch time")
         self.val_acc_logger = EpochMeter("Validation accuracy")
         self.print_freq = print_freq
+        if tb_dir is not None:
+            assert SummaryWriter is not None
+            os.makedirs(tb_dir, exist_ok=True)
+            self.tb_writer = SummaryWriter(tb_dir)
+
+    def set_train_len(self, train_len):
+        self.train_len = train_len
 
     def update_iter(self, epoch, iteration, loss):
         self.train_loss_logger.update_iter(loss)
         if iteration % self.print_freq == 0:
             print('epoch: {}\titeraion: {}\tloss: {}'.format(epoch, iteration, loss))
+            if self.tb_writer:
+                self.tb_writer.add_scalar("Train.loss", epoch * self.train_len + iteration, loss)
 
     def update_epoch(self, epoch, acc):
         self.train_loss_logger.update_epoch(epoch)
         self.val_acc_logger.update(epoch, acc)
         print('epoch: {}\tmAP accuracy: {}'.format(epoch, acc))
+        if self.tb_writer:
+            self.tb_writer.add_scalar("Val.Accuracy", epoch, acc)
 
     def update_epoch_time(self, epoch, time):
         self.train_epoch_time_logger.update(epoch, time)
@@ -102,16 +118,16 @@ class BenchLogger(Logger):
     def update(self, bs, time):
         self.images_per_ses.update(bs, time)
 
-    def print_result(self):
+    def print_result(self, do_print=False):
         total_bs = self.images_per_ses.total_images
         total_time = self.images_per_ses.total_time
         avr = self.images_per_ses.avr_images_per_second
         med = np.median(self.images_per_ses.data)
-
-        print("Done benchmarking. Total images: {}\ttotal time: {:.3f}\tAverage images/sec: {:.3f}\tMedian images/sec: {:.3f}".format(
-            total_bs,
-            total_time,
-            avr,
-            med
-        ))
+        if do_print:
+            print("Done benchmarking. Total images: {}\ttotal time: {:.3f}\tAverage images/sec: {:.3f}\tMedian images/sec: {:.3f}".format(
+                total_bs,
+                total_time,
+                avr,
+                med
+            ))
         return med

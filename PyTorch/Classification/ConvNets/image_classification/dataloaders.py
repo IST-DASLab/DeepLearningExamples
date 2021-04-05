@@ -34,6 +34,8 @@ import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 from PIL import Image
 from functools import partial
+import horovod.torch as hvd
+from . import utils
 
 DATA_BACKEND_CHOICES = ["pytorch", "syntetic"]
 try:
@@ -89,6 +91,9 @@ class HybridTrainPipe(Pipeline):
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
+        elif utils.horovod_enabled():
+            rank = hvd.rank()
+            world_size = hvd.size()
         else:
             rank = 0
             world_size = 1
@@ -151,6 +156,9 @@ class HybridValPipe(Pipeline):
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
+        elif utils.horovod_enabled():
+            rank = hvd.rank()
+            world_size = hvd.size()
         else:
             rank = 0
             world_size = 1
@@ -219,6 +227,9 @@ def get_dali_train_loader(dali_cpu=False):
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
+        elif utils.horovod_enabled():
+            rank = hvd.rank()
+            world_size = hvd.size()
         else:
             rank = 0
             world_size = 1
@@ -261,10 +272,12 @@ def get_dali_val_loader():
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
+        elif utils.horovod_enabled():
+            rank = hvd.rank()
+            world_size = hvd.size()
         else:
             rank = 0
             world_size = 1
-
         valdir = os.path.join(data_path, "val")
 
         pipe = HybridValPipe(
@@ -404,9 +417,13 @@ def get_pytorch_train_loader(
 
     if torch.distributed.is_initialized():
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    elif utils.horovod_enabled():
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset, num_replicas=hvd.size(), rank=hvd.rank())
     else:
         train_sampler = None
-
+    collate_fn = partial(fast_collate, memory_format)
+    # collate_fn = None
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -415,7 +432,7 @@ def get_pytorch_train_loader(
         worker_init_fn=_worker_init_fn,
         pin_memory=True,
         sampler=train_sampler,
-        collate_fn=partial(fast_collate, memory_format),
+        collate_fn=collate_fn,
         drop_last=True,
     )
 
@@ -442,6 +459,9 @@ def get_pytorch_val_loader(
 
     if torch.distributed.is_initialized():
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
+    elif utils.horovod_enabled():
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_dataset, num_replicas=hvd.size(), rank=hvd.rank())
     else:
         val_sampler = None
 
@@ -489,6 +509,33 @@ class SynteticDataLoader(object):
     def __iter__(self):
         while True:
             yield self.input_data, self.input_target
+
+
+def get_levels_est_loader(
+        data_path,
+        batch_size,
+        workers=8,
+        rank=0,
+        world_size=1,
+        cuda=True
+):
+    kwargs = {'num_workers': workers, 'pin_memory': True} if cuda else {}
+    train_dataset = \
+        datasets.ImageFolder(data_path,
+                             transform=transforms.Compose([
+                                 transforms.RandomResizedCrop(224),
+                                 transforms.RandomHorizontalFlip(),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                      std=[0.229, 0.224, 0.225])
+                             ]))
+    # Horovod: use DistributedSampler to partition data among workers. Manually specify
+    # `num_replicas=hvd.size()` and `rank=hvd.rank()`.
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank)
+    return torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size,
+        sampler=train_sampler, **kwargs)
 
 
 def get_syntetic_loader(

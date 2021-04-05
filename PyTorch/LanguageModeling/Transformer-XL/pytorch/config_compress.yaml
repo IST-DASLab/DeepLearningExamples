@@ -1,0 +1,7 @@
+ignore_modules:
+  - layer_norm
+  - bias
+
+modules:
+  - name: fc
+    quantization_bits: 2

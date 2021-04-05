@@ -35,7 +35,7 @@ from utils.exp_utils import benchmark
 from utils.exp_utils import create_exp_dir
 from utils.exp_utils import l2_promote
 from utils.exp_utils import log_env_info
-
+import horovod.torch as hvd
 
 def parse_args():
     parent_parser = argparse.ArgumentParser(
@@ -127,6 +127,9 @@ def parse_args():
     parser.add_argument('--local_rank',  type=int,
                         default=os.getenv('LOCAL_RANK', 0),
                         help='Used for multi-process training.')
+    parser.add_argument('--hvd', action='store_true',
+                        help='Run using horovod')
+
 
     parser.set_defaults(**config)
     args, _ = parser.parse_known_args()
@@ -257,7 +260,9 @@ def main():
         from mem_transformer import MemTransformerLM
     else:
         from inference.mem_transformer_jit import MemTransformerLM
-
+    if args.hvd:
+        hvd.init()
+        args.local_rank = hvd.local_rank()
     torch.cuda.set_device(args.local_rank)
     l2_promote()
     device = torch.device('cuda' if args.cuda else 'cpu')

@@ -27,6 +27,8 @@ from src.evaluate import evaluate
 from src.train import train_loop, tencent_trick, load_checkpoint, benchmark_train_loop, benchmark_inference_loop
 from src.data import get_train_loader, get_val_dataset, get_val_dataloader, get_coco_ground_truth
 
+import horovod.torch as hvd
+
 # Apex imports
 try:
     from apex.parallel.LARC import LARC
@@ -97,7 +99,8 @@ def make_parser():
                         help='Number of warmup iterations for benchmarking')
 
     parser.add_argument('--backbone', type=str, default='resnet50',
-                        choices=['resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152'])
+                        choices=['resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152', 'wide_resnet50',
+                                 'wide_resnet101'])
     parser.add_argument('--backbone-path', type=str, default=None,
                         help='Path to chekcpointed backbone. It should match the'
                              ' backbone model declared with the --backbone argument.'
@@ -105,6 +108,13 @@ def make_parser():
                              ' will be downloaded.')
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--amp', action='store_true')
+    parser.add_argument('--hvd', action='store_true')
+    parser.add_argument(
+        "--tensorboard-dir",
+        default=None,
+        type=str,
+        help="directory for tensorboard logs",
+    )
 
     # Distributed
     parser.add_argument('--local_rank', default=0, type=int,
@@ -127,14 +137,23 @@ def train(train_loop_func, logger, args):
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
         args.N_gpu = torch.distributed.get_world_size()
+        args.rank = torch.distributed.get_rank()
+    elif args.hvd:
+        hvd.init()
+        args.local_rank = hvd.local_rank()
+        torch.cuda.set_device(args.local_rank)
+        args.N_gpu = hvd.size()
+        args.rank = hvd.rank()
     else:
         args.N_gpu = 1
+        args.rank = 0
+        args.local_rank = 0
 
     if args.seed is None:
         args.seed = np.random.randint(1e4)
 
-    if args.distributed:
-        args.seed = (args.seed + torch.distributed.get_rank()) % 2**32
+    if args.distributed or args.hvd:
+        args.seed = (args.seed + args.rank) % 2**32
     print("Using seed = {}".format(args.seed))
     torch.manual_seed(args.seed)
     np.random.seed(seed=args.seed)
@@ -145,8 +164,9 @@ def train(train_loop_func, logger, args):
     encoder = Encoder(dboxes)
     cocoGt = get_coco_ground_truth(args)
 
-    train_loader = get_train_loader(args, args.seed - 2**31)
-
+    train_loader, train_len = get_train_loader(args, args.seed - 2**31)
+    if args.mode == "training":
+        logger.set_train_len(train_len)
     val_dataset = get_val_dataset(args)
     val_dataloader = get_val_dataloader(val_dataset, args)
 
@@ -162,9 +182,17 @@ def train(train_loop_func, logger, args):
 
     optimizer = torch.optim.SGD(tencent_trick(ssd300), lr=args.learning_rate,
                                     momentum=args.momentum, weight_decay=args.weight_decay)
-    scheduler = MultiStepLR(optimizer=optimizer, milestones=args.multistep, gamma=0.1)
+    if args.hvd:
+        compression = hvd.Compression.fp32
+        optimizer = hvd.DistributedOptimizer(optimizer,
+                                             named_parameters=ssd300.named_parameters(), op=hvd.Average, compression=compression)
+        hvd.broadcast_parameters(ssd300.state_dict(), root_rank=0)
+        hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
     if args.amp:
-        ssd300, optimizer = amp.initialize(ssd300, optimizer, opt_level='O2')
+        ssd300, optimizer = amp.initialize(ssd300, optimizer, opt_level='O1')
+
+    scheduler = MultiStepLR(optimizer=optimizer, milestones=args.multistep, gamma=0.1)
 
     if args.distributed:
         ssd300 = DDP(ssd300)
@@ -196,7 +224,6 @@ def train(train_loop_func, logger, args):
 
     for epoch in range(start_epoch, args.epochs):
         start_epoch_time = time.time()
-        scheduler.step()
         iteration = train_loop_func(ssd300, loss_func, epoch, optimizer, train_loader, val_dataloader, encoder, iteration,
                                     logger, args, mean, std)
         end_epoch_time = time.time() - start_epoch_time
@@ -224,7 +251,9 @@ def train(train_loop_func, logger, args):
                 obj['model'] = ssd300.state_dict()
             torch.save(obj, './models/epoch_{}.pt'.format(epoch))
         train_loader.reset()
-    print('total training time: {}'.format(total_time))
+        scheduler.step()
+    if args.rank == 0:
+        print('total training time: {}'.format(total_time))
 
 
 if __name__ == "__main__":
@@ -245,6 +274,6 @@ if __name__ == "__main__":
         args.epochs = 1
     else:
         train_loop_func = train_loop
-        logger = Logger('Training logger', print_freq=1)
+        logger = Logger('Training logger', print_freq=20, tb_dir=args.tensorboard_dir)
 
     train(train_loop_func, logger, args)

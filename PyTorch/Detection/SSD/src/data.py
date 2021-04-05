@@ -23,18 +23,18 @@ from src.coco import COCO
 #DALI import
 from src.coco_pipeline import COCOPipeline, DALICOCOIterator
 
+
 def get_train_loader(args, local_seed):
     train_annotate = os.path.join(args.data, "annotations/instances_train2017.json")
     train_coco_root = os.path.join(args.data, "train2017")
-
     train_pipe = COCOPipeline(args.batch_size, args.local_rank, train_coco_root,
                     train_annotate, args.N_gpu, num_threads=args.num_workers,
                     output_fp16=args.amp, output_nhwc=False,
-                    pad_output=False, seed=local_seed)
+                    pad_output=False, seed=local_seed, rank=args.rank)
     train_pipe.build()
     test_run = train_pipe.schedule_run(), train_pipe.share_outputs(), train_pipe.release_outputs()
-    train_loader = DALICOCOIterator(train_pipe, 118287 / args.N_gpu)
-    return train_loader
+    train_loader = DALICOCOIterator(train_pipe, train_pipe.epoch_size("Reader") / args.N_gpu)
+    return train_loader, train_pipe.epoch_size("Reader") / (args.N_gpu * args.batch_size)
 
 
 def get_val_dataset(args):
@@ -50,7 +50,7 @@ def get_val_dataset(args):
 
 def get_val_dataloader(dataset, args):
     if args.distributed:
-        val_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(dataset, rank=args.rank, num_replicas=args.N_gpu)
     else:
         val_sampler = None
 

@@ -99,7 +99,7 @@ class FP16Optimizer:
         for param in self.fp32_params:
             param.requires_grad = True
 
-    def step(self, loss, optimizer, scheduler, update=True):
+    def step(self, loss, optimizer, scheduler, update=True, prof=False):
         """
         Performs one step of the optimizer.
         Applies loss scaling, computes gradients in fp16, converts gradients to
@@ -170,7 +170,7 @@ class FP32Optimizer:
         self.model = model
         self.model.zero_grad()
 
-    def step(self, loss, optimizer, scheduler, update=True):
+    def step(self, loss, optimizer, scheduler, update=True, prof=False):
         """
         Performs one step of the optimizer.
 
@@ -219,7 +219,7 @@ class AMPOptimizer:
         self.model = model
         self.model.zero_grad()
 
-    def step(self, loss, optimizer, scheduler, update=True):
+    def step(self, loss, optimizer, scheduler, update=True, prof=False):
         """
         Performs one step of the optimizer.
 
@@ -227,9 +227,10 @@ class AMPOptimizer:
         :param optimizer: optimizer
         :param update: if True executes weight update
         """
+        if prof: torch.cuda.nvtx.range_push("backward")
         with amp.scale_loss(loss, optimizer) as scaled_loss:
             scaled_loss.backward()
-
+        if prof: torch.cuda.nvtx.range_pop()
         if update:
             if self.grad_clip != float('inf'):
                 clip_grad_norm_(amp.master_params(optimizer), self.grad_clip)

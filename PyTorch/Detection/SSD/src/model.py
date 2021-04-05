@@ -14,7 +14,7 @@
 
 import torch
 import torch.nn as nn
-from torchvision.models.resnet import resnet18, resnet34, resnet50, resnet101, resnet152
+from torchvision.models.resnet import resnet18, resnet34, resnet50, resnet101, resnet152, wide_resnet50_2, wide_resnet101_2
 
 
 class ResNet(nn.Module):
@@ -29,8 +29,14 @@ class ResNet(nn.Module):
         elif backbone == 'resnet50':
             backbone = resnet50(pretrained=not backbone_path)
             self.out_channels = [1024, 512, 512, 256, 256, 256]
+        elif backbone == 'wide_resnet50':
+            backbone = wide_resnet50_2(pretrained=not backbone_path)
+            self.out_channels = [1024, 512, 512, 256, 256, 256]
         elif backbone == 'resnet101':
             backbone = resnet101(pretrained=not backbone_path)
+            self.out_channels = [1024, 512, 512, 256, 256, 256]
+        elif backbone == 'wide_resnet101':
+            backbone = wide_resnet101_2(pretrained=not backbone_path)
             self.out_channels = [1024, 512, 512, 256, 256, 256]
         else:  # backbone == 'resnet152':
             backbone = resnet152(pretrained=not backbone_path)
@@ -141,12 +147,12 @@ class Loss(nn.Module):
         self.scale_xy = 1.0/dboxes.scale_xy
         self.scale_wh = 1.0/dboxes.scale_wh
 
-        self.sl1_loss = nn.SmoothL1Loss(reduce=False)
+        self.sl1_loss = nn.SmoothL1Loss(reduction='none')
         self.dboxes = nn.Parameter(dboxes(order="xywh").transpose(0, 1).unsqueeze(dim = 0),
             requires_grad=False)
         # Two factor are from following links
         # http://jany.st/post/2017-11-05-single-shot-detector-ssd-from-scratch-in-tensorflow.html
-        self.con_loss = nn.CrossEntropyLoss(reduce=False)
+        self.con_loss = nn.CrossEntropyLoss(reduction='none')
 
     def _loc_vec(self, loc):
         """

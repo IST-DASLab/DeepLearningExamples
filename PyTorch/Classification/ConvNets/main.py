@@ -45,6 +45,7 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+import json
 
 try:
     from apex.parallel import DistributedDataParallel as DDP
@@ -53,6 +54,13 @@ try:
 except ImportError:
     raise ImportError(
         "Please install apex from https://www.github.com/nvidia/apex to run this example."
+    )
+
+try:
+    import horovod.torch as hvd
+except ImportError:
+    print(
+        "Horovod is not installed"
     )
 
 import image_classification.resnet as models
@@ -65,10 +73,14 @@ from image_classification.training import *
 from image_classification.utils import *
 
 import dllogger
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..')))
+import Common.compressors as compressors
 
 
 def add_parser_arguments(parser):
-    model_names = models.resnet_versions.keys()
+    model_names = list(models.resnet_versions.keys()) + ["wide_resnet50", "wide_resnet101", "vgg16", "resnet18_convex"]
     model_configs = models.resnet_configs.keys()
 
     parser.add_argument("data", metavar="DIR", help="path to dataset")
@@ -78,8 +90,8 @@ def add_parser_arguments(parser):
         default="dali-cpu",
         choices=DATA_BACKEND_CHOICES,
         help="data backend: "
-        + " | ".join(DATA_BACKEND_CHOICES)
-        + " (default: dali-cpu)",
+             + " | ".join(DATA_BACKEND_CHOICES)
+             + " (default: dali-cpu)",
     )
 
     parser.add_argument(
@@ -235,7 +247,7 @@ def add_parser_arguments(parser):
         "--dynamic-loss-scale",
         action="store_true",
         help="Use dynamic loss scaling.  If supplied, this argument supersedes "
-        + "--static-loss-scale.",
+             + "--static-loss-scale.",
     )
     parser.add_argument(
         "--prof", type=int, default=-1, metavar="N", help="Run only N iterations"
@@ -276,7 +288,7 @@ def add_parser_arguments(parser):
     )
 
     parser.add_argument("--checkpoint-filename", default="checkpoint.pth.tar", type=str)
-    
+
     parser.add_argument(
         "--workspace",
         type=str,
@@ -291,6 +303,54 @@ def add_parser_arguments(parser):
         choices=["nchw", "nhwc"],
         help="memory layout, nchw or nhwc",
     )
+    parser.add_argument(
+        "--tensorboard-dir",
+        default=None,
+        type=str,
+        help="directory for tensorboard logs",
+    )
+    parser.add_argument(
+        "--opt-level",
+        type=str,
+        default="O1",
+        choices=["O0", "O1", "O2", "O3"],
+        help="AMP optimization levels",
+    )
+    parser.add_argument(
+        "--hvd", action="store_true", help="use horovod"
+    )
+    parser.add_argument(
+        "--bb-ratio", default=None, type=float, help="Ratio for broken barrier"
+    )
+    parser.add_argument(
+        "--bb-num-parallel-steps", default=10, type=int, help="Number of parallel steps"
+    )
+    parser.add_argument("--compression-type", type=str, default="none", choices=compressors.compression_types,
+                        help="Compression Type (default: none)")
+    parser.add_argument("--quantization-bits", type=int, default=4,
+                        help="Quantization bits (default: 4)")
+    parser.add_argument("--bucket-size", type=int, default=512,
+                        help="Quantization bucket size (default: 512)")
+    parser.add_argument('--error-feedback', action='store_true', default=False,
+                        help='enable error correction')
+    parser.add_argument("--efx-bits", type=int, default=None,
+                        help="Quantization bits of error feedback (default - no efx)")
+    parser.add_argument("--efx-randk", type=float, default=None,
+                        help="Randk of error feedback compression (default - no efx)")
+    parser.add_argument('--topk-ratio', type=float, default=0.01,
+                        help='topK selecting ratio (default: 0.01)')
+    parser.add_argument('--big-grad', action='store_true', default=False,
+                        help='stack all gradients into signle tensor before compression and allreduce')
+    parser.add_argument('--dgc', action='store_true', default=False,
+                        help='Do deep gradient compression')
+    parser.add_argument("--compressor-warmup-steps", type=int, default=0,
+                        help="Warm up period for compressor")
+    parser.add_argument("--local_rank", type=int, default=0,
+                        help="local rank")
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def main(args):
@@ -299,12 +359,19 @@ def main(args):
     best_prec1 = 0
 
     args.distributed = False
-    if "WORLD_SIZE" in os.environ:
+    if args.hvd:
+        hvd.init()
+        args.local_rank = hvd.local_rank()
+    elif "WORLD_SIZE" in os.environ:
         args.distributed = int(os.environ["WORLD_SIZE"]) > 1
         args.local_rank = int(os.environ["LOCAL_RANK"])
 
     args.gpu = 0
     args.world_size = 1
+    if args.hvd:
+        args.gpu = args.local_rank % hvd.local_size()
+        torch.cuda.set_device(args.gpu)
+        args.world_size = hvd.size()
 
     if args.distributed:
         args.gpu = args.local_rank % torch.cuda.device_count()
@@ -446,8 +513,10 @@ def main(args):
         fp16=args.fp16,
         memory_format=memory_format,
     )
-
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    is_root = (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or (
+            args.hvd and hvd.rank() == 0) or \
+              (not args.hvd and not torch.distributed.is_initialized())
+    if is_root:
         logger = log.Logger(
             args.print_freq,
             [
@@ -460,13 +529,14 @@ def main(args):
                 ),
             ],
             start_epoch=start_epoch - 1,
+            tb_dir=args.tensorboard_dir,
+            train_steps_per_epoch=train_loader_len,
+            val_steps_per_epoch=val_loader_len,
         )
-
     else:
         logger = log.Logger(args.print_freq, [], start_epoch=start_epoch - 1)
 
     logger.log_parameter(args.__dict__, verbosity=dllogger.Verbosity.DEFAULT)
-
     optimizer = get_optimizer(
         list(model_and_loss.model.named_parameters()),
         args.fp16,
@@ -481,26 +551,63 @@ def main(args):
     )
 
     if args.lr_schedule == "step":
+        # lr_policy = lr_step_policy(
+        #     args.lr, [30, 60, 80], 0.1, args.warmup, logger=logger
+        # )
         lr_policy = lr_step_policy(
-            args.lr, [30, 60, 80], 0.1, args.warmup, logger=logger
+            args.lr, [3, 12, 20], 0.01, args.warmup, logger=logger
         )
     elif args.lr_schedule == "cosine":
         lr_policy = lr_cosine_policy(args.lr, args.warmup, args.epochs, logger=logger)
     elif args.lr_schedule == "linear":
         lr_policy = lr_linear_policy(args.lr, args.warmup, args.epochs, logger=logger)
 
+    bb_settings = None
+    compression = None
+    if args.hvd:
+        if args.dgc:
+            optimizer = compressors.DGCompressor(model_and_loss.model.parameters(), args.lr,
+                                                 args.momentum,
+                                                 args.weight_decay,
+                                                 nesterov=args.nesterov,
+                                                 k_ratio=args.topk_ratio, warmup_steps=args.compressor_warmup_steps,
+                                                 clip=0.25
+                                                 )
+        else:
+            compression = compressors.get_compressor(args, model_and_loss.model.named_parameters())
+            if args.big_grad:
+                optimizer = compressors.CompressedSGDBig(optimizer, compression)
+            else:
+                optimizer = hvd.DistributedOptimizer(optimizer,
+                                                     named_parameters=model_and_loss.model.named_parameters(),
+                                                     op=hvd.Average, compression=compression)
+
     if args.amp:
         model_and_loss, optimizer = amp.initialize(
             model_and_loss,
             optimizer,
-            opt_level="O1",
+            opt_level=args.opt_level,
             loss_scale="dynamic" if args.dynamic_loss_scale else args.static_loss_scale,
+            verbosity=0,
         )
 
     if args.distributed:
-        model_and_loss.distributed()
-
+        model_and_loss.distributed(hvd_dist=args.hvd, fake_comp_ratio=1.0)
+    if is_root:
+        print("Model size {}".format(count_parameters(model_and_loss)))
     model_and_loss.load_model_state(model_state)
+    if args.hvd and hvd.size() > 1:
+        hvd.broadcast_parameters(model_and_loss.model.state_dict(), root_rank=0)
+        hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+    if issubclass(type(compression), compressors.Quantizer):
+        with open(os.path.join(args.workspace, "compress_scheme.json"), 'w') as f:
+            d = compression.parameters_qbits
+            if args.quantization_bits in d:
+                d[args.quantization_bits].append("others")
+            else:
+                d[args.quantization_bits] = ["others"]
+            json.dump(d, f)
+
 
     train_loop(
         model_and_loss,
@@ -524,11 +631,13 @@ def main(args):
         save_checkpoints=args.save_checkpoints and not args.evaluate,
         checkpoint_dir=args.workspace,
         checkpoint_filename=args.checkpoint_filename,
+        bb_settings=bb_settings,
+        compression=compression
     )
     exp_duration = time.time() - exp_start_time
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    if is_root:
         logger.end()
-    print("Experiment ended")
+    print("Experiment ended, total time: {:.2f}".format(exp_duration))
 
 
 if __name__ == "__main__":

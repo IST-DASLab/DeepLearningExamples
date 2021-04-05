@@ -32,7 +32,19 @@ import numpy as np
 import torch
 import shutil
 import torch.distributed as dist
+import horovod.torch as hvd
 
+hvd_init = None
+
+def horovod_enabled():
+    global hvd_init
+    if hvd_init is None:
+        try:
+            hvd.size()
+            hvd_init = True
+        except ValueError:
+            hvd_init = False
+    return hvd_init
 
 def should_backup_checkpoint(args):
     def _sbc(epoch):
@@ -89,17 +101,20 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+        correct_k = correct[:k].float().sum()
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
 
 def reduce_tensor(tensor):
     rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-    rt /= (
-        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    )
+    if horovod_enabled():
+        rt = hvd.allreduce(rt, op=hvd.Sum)
+        world_size = hvd.size()
+    else:
+        dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    rt /= world_size
     return rt
 
 

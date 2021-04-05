@@ -1,7 +1,8 @@
 # Base
 wt103: &wt103
    dataset: wt103
-   data: ../data/wikitext-103/
+   data: /home/imarkov/Datasets/transformer_data/wikitext-103/
+#   data: /datasets/transformer_data/wikitext-103/
 
 train: &train
    <<: *wt103
@@ -251,7 +252,27 @@ dgxa100_1gpu_tf32: &dgxa100_1gpu_tf32
    eval:
       <<: *eval
 
+rtx2080: &rtx2080
+   train:
+      <<: *train
+      fp16: true
+      append_dataset: false
+      batch_chunk: 4
+      max_step: 160000
+#      local_batch_size: 32
+      no_eval: false
+      amp_mode: O2
+   eval:
+      <<: *eval
+
 # Training benchmarks
+trainbench_rtx2080: &trainbench_rtx2080
+   train:
+      <<: *rtx2080
+      log_interval: 1
+      max_step: 500
+      local_batch_size: 24
+
 trainbench: &trainbench
    train:
       <<: *train

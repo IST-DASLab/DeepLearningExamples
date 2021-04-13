@@ -14,25 +14,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 NUM_NODES=8
-q=8
+q=4
 bucket_size=1024
 
-workdir="workdir_quan/sra_${q}_${bucket_size}"
-#compression_config_file="--compression-config-filename config_compress.yaml"
-compression_config_file=""
+compression_config_file="--compression-config-filename config_compress.yaml"
+#compression_config_file=""
 
-mkdir -p $workdir
 echo 'Run training...'
 for type in SRA; do
+  workdir="workdir_quan/${type}_${q}_${bucket_size}"
+  mkdir -p $workdir
   horovodrun -np $NUM_NODES -q $q --compression-bucket-size ${bucket_size} \
-      --compression-nccl-fake-ratio 0.5 \
+      --compression-nccl-fake-ratio 1.0 \
       --reduction-type $type --communicator-type MPI --compression-type maxmin \
-      --fusion-threshold-mb 4 --cache-capacity 2048 --no-hierarchical-allgather --cycle-time-ms 1 --no-hierarchical-allreduce \
-      --compression-mode NonFused \
+      --fusion-threshold-mb 128 --cache-capacity 2048 --no-hierarchical-allgather --cycle-time-ms 1 --no-hierarchical-allreduce \
+      --compression-mode NonFused --compression-skip-incomplete-buckets $compression_config_file \
       python train.py \
       --config_file wt103_base.yaml \
-      --config rtx2080 \
+      --config rtx3090_fp16 \
       --hvd \
       --work_dir $workdir \
+      --dllog_file train_log.json --txtlog_file train_log.log \
       "${@:2}" 2>&1
 done

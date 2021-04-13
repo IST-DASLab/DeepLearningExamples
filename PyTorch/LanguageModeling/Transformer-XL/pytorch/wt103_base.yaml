@@ -1,8 +1,8 @@
 # Base
 wt103: &wt103
    dataset: wt103
-   data: /home/imarkov/Datasets/transformer_data/wikitext-103/
-#   data: /datasets/transformer_data/wikitext-103/
+   data: /nvmedisk/Datasets/wikitext-103/
+#   data: /home/imarkov/Datasets/transformer_data/wikitext-103/
 
 train: &train
    <<: *wt103
@@ -249,6 +249,15 @@ dgxa100_1gpu_tf32: &dgxa100_1gpu_tf32
    train:
       <<: *train
       batch_chunk: 8
+   eval:
+      <<: *eval
+
+rtx3090_fp16: &rtx3090
+   train:
+      <<: *train
+      fp16: true
+      append_dataset: false
+      no_eval: false
    eval:
       <<: *eval
 

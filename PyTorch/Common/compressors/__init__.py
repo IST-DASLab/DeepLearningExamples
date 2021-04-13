@@ -11,7 +11,7 @@ def get_compressor(args, named_parameters):
         return hvd.Compression.none
         # return hvd.Compression.fp16() if args.fp16_allreduce else hvd.Compression.none
     else:
-        if args.efx_bits is not None or args.efx_randk is not None:
+        if getattr(args, "efx_bits", None) is not None or getattr(args, "efx_randk", None) is not None:
             ef_q = {"bits": args.efx_bits, "bucket_size": args.bucket_size, "rand_k": args.efx_randk}
             error_feedback = False
         else:

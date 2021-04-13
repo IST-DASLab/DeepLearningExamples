@@ -551,12 +551,12 @@ def main(args):
     )
 
     if args.lr_schedule == "step":
-        # lr_policy = lr_step_policy(
-        #     args.lr, [30, 60, 80], 0.1, args.warmup, logger=logger
-        # )
         lr_policy = lr_step_policy(
-            args.lr, [3, 12, 20], 0.01, args.warmup, logger=logger
+            args.lr, [30, 60, 80], 0.1, args.warmup, logger=logger
         )
+        # lr_policy = lr_step_policy(
+        #     args.lr, [3, 12, 20], 0.01, args.warmup, logger=logger
+        # )
     elif args.lr_schedule == "cosine":
         lr_policy = lr_cosine_policy(args.lr, args.warmup, args.epochs, logger=logger)
     elif args.lr_schedule == "linear":
@@ -599,15 +599,6 @@ def main(args):
     if args.hvd and hvd.size() > 1:
         hvd.broadcast_parameters(model_and_loss.model.state_dict(), root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-    if issubclass(type(compression), compressors.Quantizer):
-        with open(os.path.join(args.workspace, "compress_scheme.json"), 'w') as f:
-            d = compression.parameters_qbits
-            if args.quantization_bits in d:
-                d[args.quantization_bits].append("others")
-            else:
-                d[args.quantization_bits] = ["others"]
-            json.dump(d, f)
-
 
     train_loop(
         model_and_loss,

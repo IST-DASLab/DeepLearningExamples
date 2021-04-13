@@ -48,8 +48,9 @@ from utils.exp_utils import register_ignoring_timeout_handler
 
 import horovod.torch as hvd
 # import powersgd
-# sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..', '..')))
-# from Common.compressors import compressors
+sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..', '..')))
+import Common.compressors as compressors
+import json
 
 def parse_args():
     parent_parser = argparse.ArgumentParser(
@@ -241,8 +242,8 @@ def parse_args():
                       help='Used for multi-process training.')
     parser.add_argument('--hvd', action='store_true',
                         help='Run using horovod')
-    # parser.add_argument("--compression-type", type=str, default="none", choices=compression_types,
-    #                     help="Compression Type (default: none)")
+    parser.add_argument("--compression-type", type=str, default="none", choices=compressors.compression_types,
+                        help="Compression Type (default: none)")
     parser.add_argument("--quantization-bits", type=int, default=4,
                         help="Quantization bits (default: 4)")
     parser.add_argument("--bucket-size", type=int, default=512,
@@ -257,8 +258,8 @@ def parse_args():
                         help='stack all gradients into signle tensor before compression and allreduce')
     parser.add_argument("--compressor-warmup-steps", type=int, default=0,
                         help="Warm up period for compressor")
-    parser.add_argument('--powersgd-reducer', type=str, choices=powersgd.supported_reducers, default='none',
-                        help="Reducer from powersgd repo")
+    # parser.add_argument('--powersgd-reducer', type=str, choices=powersgd.supported_reducers, default='none',
+    #                     help="Reducer from powersgd repo")
     parser.add_argument('--optimizer-reducer-rank', type=int, default=4, help="Powersgd rank")
 
     parser.set_defaults(**config)
@@ -443,10 +444,10 @@ def evaluate(eval_iter, model, args):
 def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
           optimizer_sparse, scheduler, scheduler_sparse, vocab, epoch,
           last_batch, last_iter, train_step, best_val_loss, meters,
-          timeout_handler, args):
+          timeout_handler, args, compression):
     # Turn on training mode which enables dropout.
     model.train()
-
+    is_quantization_compression = issubclass(type(compression), compressors.Quantizer)
     train_loss = 0
     target_tokens = 0
     log_step = 0
@@ -490,11 +491,14 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
         if args.hvd and args.fp16:
             with optimizer.skip_synchronize():
                 optimizer.step()
-            # optimizer.step()
         else:
             optimizer.step()
         if optimizer_sparse:
             optimizer_sparse.step()
+
+        # update synchronized gradients stats
+        if is_quantization_compression:
+            compression.update_metric_stats(model.parameters())
 
         # step-wise learning rate annealing
         train_step += 1
@@ -567,6 +571,21 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
         do_periodic_eval = train_step % args.eval_interval == 0
         is_final_step = train_step == args.max_step
         interrupted = timeout_handler.interrupted
+        if train_step > 0 and train_step % args.eval_interval == 0 and is_quantization_compression:
+            d, sum = compression.get_metrics_magnitudes()
+            compression.adjust_bits()
+            if d:
+                if args.local_rank == 0:
+                    directory = os.path.join(args.work_dir, "adapt-logs")
+                    os.makedirs(directory, exist_ok=True)
+                    file = "step_{}.json".format(train_step)
+                    with open(os.path.join(directory, file), 'w') as f:
+                        # d = {k: v / sum for k,v in d.items()}
+                        json.dump(d, f)
+                    d = compression.get_compression_scheme()
+                    file = "compress_scheme_{}.json".format(train_step)
+                    with open(os.path.join(directory, file), 'w') as f:
+                        json.dump(d, f)
 
         if (do_periodic_eval or is_final_step or interrupted) and not args.no_eval:
             eval_start_time = time.time()
@@ -802,10 +821,10 @@ def main():
                                  weight_decay=args.weight_decay)
         optimizer_sparse = None
     model = model.to(device)
-
+    compression = None
     if args.hvd and args.multi_gpu == 'ddp':
-        compression = hvd.Compression.none
-        # compression = compressors.get_compressor(args, model.named_parameters())
+        # compression = hvd.Compression.none
+        compression = compressors.get_compressor(args, model.named_parameters())
         # compression = hvd.Compression.fp32
         if not args.big_grad:
             optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), op=hvd.Average,
@@ -943,7 +962,7 @@ def main():
                     tr_iter, va_iter, model, para_model, model_config,
                     optimizer, optimizer_sparse, scheduler, scheduler_sparse,
                     vocab, epoch, last_batch, last_iter, train_step,
-                    best_val_loss, meters, timeout_handler, args
+                    best_val_loss, meters, timeout_handler, args, compression
                     )
 
                 last_batch = 0

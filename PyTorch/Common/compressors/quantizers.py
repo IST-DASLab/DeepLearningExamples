@@ -1,66 +1,110 @@
 import torch
 from .compressor import Compressor
+import horovod.torch as hvd
 
 
 class Quantizer(Compressor):
     def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None):
         super().__init__()
         self.bits = bits
+        self.bits_min = 4
+        self.bits_max = bits
         self.num_levels = 1 << bits
         self.bucket_size = bucket_size
-        self.stats = [0 for i in range(self.num_levels)]
-        self.state = {}
+        self.states = {}
         self.save_error_correction = enable_error_correction
         self.apply_error_correction = False
+        self.bit_levels = [self.bits]
+        self.momentum_acc = 0.9
+        self.excluded_layer_names = ["layer_norm", "bias", "bn"]
         if named_parameters:
             named_parameters = list(named_parameters)
             self.named_parameters = {p: name for name, p in named_parameters if p.requires_grad}
             self.parameters_sizes = {name: p.numel() for name, p in named_parameters if p.requires_grad}
+            self.parameters_qbits = {}
+            # self.exact_match = {name: False for name in named_parameters}
+            # for i in range(len(named_parameters)):
+            #     for j in range(i + 1, len(named_parameters)):
+            #         if named_parameters[i] in named_parameters[j]:
+            #             self.exact_match[named_parameters[j]] = True
+
         else:
             self.named_parameters = None
             self.parameters_sizes = None
-        self.parameters_qbits = {32: ["bn"], 2: ['layer4.1.conv2.weight',
-                                                 'layer4.1.conv1.weight',
-                                                 'layer4.0.conv2.weight',
-                                                 'layer4.0.conv1.weight',
-                                                 'layer3.1.conv2.weight',
-                                                 'layer3.1.conv1.weight',
-                                                 'layer3.0.conv2.weight',
-                                                 'layer3.0.conv1.weight',
-                                                 'fc.weight']}
 
     def get_states(self):
-        return self.state
+        return self.states
 
-    def get_ef_magnitudes(self):
+    def update_metric_stats(self, parameters):
+        for p in parameters:
+            if not p.requires_grad or p not in self.states:
+                continue
+            state = self.states[p]
+            d_p = p.grad.data
+            if p.grad.data.dtype == torch.float16:
+                d_p = d_p.float()
+            if "momentum" not in state:
+                state["momentum"] = torch.zeros_like(d_p)
+            state["momentum"].mul_(self.momentum_acc).add_(d_p)
+
+    def _get_metric(self, p, compute=True):
+        state = self.states[p]
+        if compute:
+            buf = state["momentum"]
+            self.set_compression_parameters(p)
+            if torch.isinf(buf).sum() > 0:
+                state["compression_error"] = float("inf")
+            else:
+                state["compression_error"] = (buf - self._compress(buf, inplace=False)).norm(p=2).item()
+        return state["compression_error"]
+        # return state["momentum"].norm(p=2).item()
+        # return state["error_correction"].norm(p=2).item()
+
+    def adjust_bits(self):
+        max_value = 0.0
+        for p in self.states.keys():
+            value = self._get_metric(p)
+            if value == float("inf") or value != value or value < 1e-10:
+                # don't take this value into account
+                continue
+            max_value = max(value, max_value)
+        unit = (self.bits_max - self.bits_min) / max_value
+        for p, state in self.states.items():
+            value = self._get_metric(p, compute=False)
+            if value < 1e-10:
+                # if wasn't compressed
+                bits = 32
+            elif value == float("inf") or value != value:
+                # if gradient explodes or metric equal to NaN
+                bits = self.bits_max
+            else:
+                bits = int(self.bits_min + unit * value)
+            state["bits"] = bits
+
+    def get_metrics_magnitudes(self):
         d = {}
         sum = 0.0
-        if self.save_error_correction:
+        if self.named_parameters:
             for p, name in self.named_parameters.items():
-                if p in self.state:
-                    d[name] = self.state[p]["error_correction"].norm(p=2).item() / p.numel()
+                if p in self.states:
+                    d[name] = self._get_metric(p)
                     sum += d[name]
-                else:
-                    flag = False
-                    for skip_name in self.parameters_qbits[32]:
-                        if skip_name in name:
-                            flag = True
-                    if not flag:
-                        print(name)
         return d, sum
 
-    def set_num_levels(self, p):
-        if self.named_parameters:
-            for bits, names in self.parameters_qbits.items():
-                for name in names:
-                    if name in self.named_parameters[p]:
-                        if name == "conv1.weight" and name != self.named_parameters[p]:
-                            # TODO: generalize the case of full inclusion of layers names
-                            # exact match with conv1.weight
-                            continue
-                        self.num_levels = 1 << bits
-                        return
-        self.num_levels = 1 << self.bits
+    def get_compression_scheme(self):
+        d = {32: self.excluded_layer_names.copy()}
+        for p, state in self.states.items():
+            name = self.named_parameters[p]
+            bits = state["bits"]
+            if bits in d:
+                d[bits].append(name)
+            else:
+                d[bits] = [name]
+        return d
+
+    def set_compression_parameters(self, p):
+        bits = self.states[p]["bits"]
+        self.num_levels = 1 << bits
 
     def quantize_bucket(self, a):
         raise NotImplementedError
@@ -72,29 +116,42 @@ class Quantizer(Compressor):
         if not p.requires_grad:
             return p, None
         if self.named_parameters:
-            for skip_name in self.parameters_qbits[32]:
+            for skip_name in self.excluded_layer_names:
                 if skip_name in self.named_parameters[p]:
                     return p.grad, None
         d_p = p.grad.data
-        if p not in self.state:
-            self.state[p] = {}
-            self.state[p]["error_correction"] = torch.zeros_like(d_p)
-            self.state[p]["rel_error"] = torch.Tensor([0.0]).to(d_p.device)
-        state = self.state[p]
+        if p.grad.data.dtype == torch.float16:
+            d_p = d_p.float()
+
+        if p not in self.states:
+            self.states[p] = {}
+            self.states[p]["error_correction"] = torch.zeros_like(d_p)
+            self.states[p]["bits"] = self.bits
+        state = self.states[p]
         e_c = state["error_correction"]
-        # rel_error = state["rel_error"]
 
         if self.save_error_correction:
             # update error correction before subtraction
+            if self.momentum_acc:
+                e_c.mul_(self.momentum_acc)
             e_c.add_(d_p)
-            # grad_copy = d_p.clone().detach()
             # add error correction
             if self.apply_error_correction:
                 d_p.copy_(e_c)
+        self.set_compression_parameters(p)
+        self._compress(d_p)
+        if self.save_error_correction:
+            e_c.sub_(d_p)
+            # grad_copy.sub_(d_p)
+        if p.grad.data.dtype == torch.float16:
+            p.grad.data.copy_(d_p.half())
+        return p.grad, None
 
-        a = d_p.view(-1)
+    def _compress(self, tensor, inplace=True):
+        if not inplace:
+            tensor = tensor.clone()
+        a = tensor.view(-1)
         numel = a.numel()
-        self.set_num_levels(p)
         if self.bucket_size == -1:
             a[:] = self.quantize_bucket(a)
         else:
@@ -103,11 +160,7 @@ class Quantizer(Compressor):
                 a[:main_chunk_size] = self.quantize_bucket(a[:main_chunk_size].view((-1, self.bucket_size))).view(-1)
             # if numel - main_chunk_size > 0:
             #     a[main_chunk_size:] = self.quantize_bucket(a[main_chunk_size:])
-        if self.save_error_correction:
-            e_c.sub_(d_p)
-            # grad_copy.sub_(d_p)
-            # rel_error += grad_copy.norm(p=2) / d_p.norm(p=2).add(1e-10)
-        return p.grad, None
+        return tensor
 
     @staticmethod
     def count_unique(buf):
@@ -179,7 +232,7 @@ class MaxMinQuantizer(Quantizer):
         super().__init__(bits, bucket_size, enable_error_correction, named_parameters)
 
     def quantize_bucket(self, a):
-        if self.num_levels == 1 << 32:
+        if self.num_levels == 1 << 32 or torch.isinf(a).sum() > 0:
             return a
         if a.dim() == 2:
             fmin = torch.min(a, dim=1)[0]
@@ -199,7 +252,6 @@ class MaxMinQuantizer(Quantizer):
         a /= unit
         a += torch.empty(a.size(), device=a.device).uniform_(0, 1)
         torch.floor_(a)
-        # self.update_stats(a)
         a *= unit
         a += fmin
         return a

@@ -299,6 +299,7 @@ def train(
         prof=-1,
         batch_size_multiplier=1,
         register_metrics=True,
+        compression=None,
 ):
     if register_metrics and logger is not None:
         logger.register_metric(
@@ -366,6 +367,8 @@ def train(
         loss = step(input, target, optimizer_step=optimizer_step)
 
         it_time = time.time() - end
+        if issubclass(type(compression), compressors.Quantizer):
+            compression.update_metric_stats(model_and_loss.model.parameters())
 
         if logger is not None:
             logger.log_metric("train.loss", to_python_float(loss), bs)
@@ -589,15 +592,21 @@ def train_loop(
             )
         if logger is not None:
             logger.end_epoch()
+
         if issubclass(type(compression), compressors.Quantizer):
             d, sum = compression.get_ef_magnitudes()
             if d:
-                directory = os.path.join(checkpoint_dir, "bits-{}".format(compression.bits))
+                directory = os.path.join(checkpoint_dir, "adapt_logs".format(compression.bits))
                 os.makedirs(directory, exist_ok=True)
                 file = "epoch{}.json".format(epoch)
+                compression.adjust_bits()
                 if root:
                     with open(os.path.join(directory, file), 'w') as f:
                         # d = {k: v / sum for k,v in d.items()}
+                        json.dump(d, f)
+                    d = compression.get_compression_scheme()
+                    file = "compress_scheme_{}.json".format(epoch)
+                    with open(os.path.join(directory, file), 'w') as f:
                         json.dump(d, f)
 
         if save_checkpoints and root:

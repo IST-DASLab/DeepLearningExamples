@@ -37,10 +37,17 @@ from . import logger as log
 from . import resnet as models
 from . import utils
 import dllogger
-import horovod.torch as hvd
+
+try:
+    import horovod.torch as hvd
+except ImportError:
+    print(
+        "Horovod is not installed"
+    )
 import json
 
 import sys
+
 sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..')))
 import Common.compressors as compressors
 
@@ -53,6 +60,7 @@ except ImportError:
     raise ImportError(
         "Please install apex from https://www.github.com/nvidia/apex to run this example."
     )
+import torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook as powerSGD
 
 ACC_METADATA = {"unit": "%", "format": ":.2f"}
 IPS_METADATA = {"unit": "img/s", "format": ":.2f"}
@@ -80,7 +88,7 @@ class ModelAndLoss(nn.Module):
             model.load_state_dict(pretrained_weights)
 
         if cuda:
-            model = model.cuda() #.to(memory_format=memory_format)
+            model = model.cuda()  # .to(memory_format=memory_format)
         if fp16:
             model = network_to_half(model)
 
@@ -99,10 +107,16 @@ class ModelAndLoss(nn.Module):
 
         return loss, output
 
-    def distributed(self, fake_comp_ratio=1.0, num_allreduce_streams=1, hvd_dist=False):
+    def distributed(self, powersgd_rank=None):
         # self.model = DDP(self.model)
         rank = torch.distributed.get_rank()
         self.model = DDP(self.model, device_ids=[rank], output_device=rank)
+        if powersgd_rank:
+            state = powerSGD.PowerSGDState(torch.distributed.group.WORLD,
+                                           matrix_approximation_rank=powersgd_rank, warm_start=True, start_powerSGD_iter=2,
+                                           use_error_feedback=True)
+            self.model.register_comm_hook(state, powerSGD.powerSGD_hook)
+            # self.model.register_comm_hook(torch.distributed.group.WORLD, self.encode_and_decode)
 
     # def distributed(self, fake_comp_ratio=1.0, num_allreduce_streams=1, hvd_dist=False):
     #     self.model = DDP(self.model, fake_comp_ratio=fake_comp_ratio, num_allreduce_streams=num_allreduce_streams,
@@ -222,7 +236,7 @@ def lr_cosine_policy(base_lr, warmup_length, epochs, logger=None):
 
 
 def lr_exponential_policy(
-    base_lr, warmup_length, epochs, final_multiplier=0.001, logger=None
+        base_lr, warmup_length, epochs, final_multiplier=0.001, logger=None
 ):
     es = epochs - warmup_length
     epoch_decay = np.power(2, np.log2(final_multiplier) / es)
@@ -242,7 +256,8 @@ def get_train_step(
         model_and_loss, optimizer, fp16, use_amp=False, batch_size_multiplier=1
 ):
     hvd_enabled = utils.horovod_enabled()
-    def _step(input, target, optimizer_step=True):
+
+    def _step(input, target, optimizer_step=True, compression=None):
         # optimizer.zero_grad()
         input_var = Variable(input)
         target_var = Variable(target)
@@ -251,7 +266,6 @@ def get_train_step(
             reduced_loss = utils.reduce_tensor(loss.data)
         else:
             reduced_loss = loss.data
-
         if fp16:
             optimizer.backward(loss)
         elif use_amp:
@@ -261,7 +275,8 @@ def get_train_step(
                     optimizer.synchronize()
         else:
             loss.backward()
-
+        if issubclass(type(compression), compressors.Quantizer):
+            compression.update_metric_stats(model_and_loss.model.parameters())
         if optimizer_step:
             opt = (
                 optimizer.optimizer
@@ -356,19 +371,17 @@ def train(
     for i, (input, target) in data_iter:
         bs = input.size(0)
         lr_scheduler(optimizer, i, epoch)
-        if hvd_enabled:
-            torch.cuda.synchronize()
-            # hvd.allreduce(torch.tensor([0], dtype=torch.int32, device=input.device), name="barrier")
-        elif torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.cuda.synchronize()
-            # torch.distributed.barrier()
+        # if hvd_enabled:
+        #     torch.cuda.synchronize()
+        #     # hvd.allreduce(torch.tensor([0], dtype=torch.int32, device=input.device), name="barrier")
+        # elif torch.distributed.is_available() and torch.distributed.is_initialized():
+        #     torch.cuda.synchronize()
+        #     # torch.distributed.barrier()
         data_time = time.time() - end
         optimizer_step = ((i + 1) % batch_size_multiplier) == 0
-        loss = step(input, target, optimizer_step=optimizer_step)
+        loss = step(input, target, optimizer_step=optimizer_step, compression=compression)
 
         it_time = time.time() - end
-        if issubclass(type(compression), compressors.Quantizer):
-            compression.update_metric_stats(model_and_loss.model.parameters())
 
         if logger is not None:
             logger.log_metric("train.loss", to_python_float(loss), bs)
@@ -577,6 +590,7 @@ def train_loop(
                 prof=prof,
                 register_metrics=epoch == start_epoch,
                 batch_size_multiplier=batch_size_multiplier,
+                compression=compression
             )
         if root:
             print("Time per epoch: ", time.time() - end)
@@ -594,12 +608,16 @@ def train_loop(
             logger.end_epoch()
 
         if issubclass(type(compression), compressors.Quantizer):
-            d, sum = compression.get_ef_magnitudes()
+            d, sum = compression.get_metrics_magnitudes()
+            if epoch > 0 and epoch % 10 == 0:
+                compression.reset_metrics()
+                d, sum = compression.get_metrics_magnitudes()
+            else:
+                compression.adjust_bits()
             if d:
                 directory = os.path.join(checkpoint_dir, "adapt_logs".format(compression.bits))
                 os.makedirs(directory, exist_ok=True)
                 file = "epoch{}.json".format(epoch)
-                compression.adjust_bits()
                 if root:
                     with open(os.path.join(directory, file), 'w') as f:
                         # d = {k: v / sum for k,v in d.items()}

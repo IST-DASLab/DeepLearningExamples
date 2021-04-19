@@ -1,8 +1,8 @@
 # Base
 wt103: &wt103
    dataset: wt103
-   data: /nvmedisk/Datasets/wikitext-103/
-#   data: /home/imarkov/Datasets/transformer_data/wikitext-103/
+   data: /home/imarkov/Datasets/transformer_data/wikitext-103/
+#   data: /nvmedisk/Datasets/wikitext-103/
 
 train: &train
    <<: *wt103
@@ -266,9 +266,7 @@ rtx2080: &rtx2080
       <<: *train
       fp16: true
       append_dataset: false
-      batch_chunk: 4
-      max_step: 160000
-#      local_batch_size: 32
+      batch_chunk: 8
       no_eval: false
       amp_mode: O2
    eval:

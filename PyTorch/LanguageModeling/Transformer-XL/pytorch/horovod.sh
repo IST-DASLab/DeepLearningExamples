@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 NUM_NODES=8
-q=4
+q=5
 bucket_size=1024
 
 compression_config_file="--compression-config-filename config_compress.yaml"
@@ -22,11 +22,12 @@ compression_config_file="--compression-config-filename config_compress.yaml"
 
 echo 'Run training...'
 for type in SRA; do
-  workdir="workdir_quan/${type}_${q}_${bucket_size}"
+#  workdir="workdir_quan/${type}_${q}_${bucket_size}"
+  workdir="workdir_topk/test"
   mkdir -p $workdir
   horovodrun -np $NUM_NODES -q $q --compression-bucket-size ${bucket_size} \
       --compression-nccl-fake-ratio 1.0 \
-      --reduction-type $type --communicator-type MPI --compression-type maxmin \
+      --reduction-type $type --communicator-type SHM --compression-type maxmin \
       --fusion-threshold-mb 128 --cache-capacity 2048 --no-hierarchical-allgather --cycle-time-ms 1 --no-hierarchical-allreduce \
       --compression-mode NonFused --compression-skip-incomplete-buckets $compression_config_file \
       python train.py \
@@ -35,5 +36,6 @@ for type in SRA; do
       --hvd \
       --work_dir $workdir \
       --dllog_file train_log.json --txtlog_file train_log.log \
+      --max_step 200 --debug \
       "${@:2}" 2>&1
 done

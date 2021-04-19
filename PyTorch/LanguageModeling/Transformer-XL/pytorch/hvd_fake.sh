@@ -1,9 +1,9 @@
 #!/bin/bash
 NUM_NODES=8
-q=8
-bucket_size=1024
+q=5
+bucket_size=128
 
-workdir="workdir_stats/linadapt_8bits-1"
+workdir="workdir_stats/linadapt_5bits-4"
 mkdir -p $workdir
 horovodrun -np $NUM_NODES \
     python train.py \

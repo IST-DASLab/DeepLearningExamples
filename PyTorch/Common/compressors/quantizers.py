@@ -8,14 +8,15 @@ class Quantizer(Compressor):
         super().__init__()
         self.bits = bits
         self.bits_min = 4
-        self.bits_max = bits
+        self.bits_max = 8
+        self.bits_default = bits
         self.num_levels = 1 << bits
         self.bucket_size = bucket_size
         self.states = {}
         self.save_error_correction = enable_error_correction
         self.apply_error_correction = False
         self.bit_levels = [self.bits]
-        self.momentum_acc = 0.9
+        self.momentum_acc = 0.8
         self.excluded_layer_names = ["layer_norm", "bias", "bn"]
         if named_parameters:
             named_parameters = list(named_parameters)
@@ -34,6 +35,11 @@ class Quantizer(Compressor):
 
     def get_states(self):
         return self.states
+
+    def reset_metrics(self):
+        for p, state in self.states.items():
+            state["momentum"].fill_(0.0)
+            state["bits"] = self.bits_default
 
     def update_metric_stats(self, parameters):
         for p in parameters:
@@ -76,7 +82,7 @@ class Quantizer(Compressor):
                 bits = 32
             elif value == float("inf") or value != value:
                 # if gradient explodes or metric equal to NaN
-                bits = self.bits_max
+                bits = self.bits_default
             else:
                 bits = int(self.bits_min + unit * value)
             state["bits"] = bits

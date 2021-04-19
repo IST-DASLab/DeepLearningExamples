@@ -19,7 +19,8 @@ if [[ "$1" == 'train' ]]; then
     workdir="workdir_topk/baseline_dist"
     mkdir -p $workdir
     python -m torch.distributed.launch --nproc_per_node="$2" train.py \
-        --config_file wt103_base.yaml --config rtx2080 --work_dir $workdir \
+        --config_file wt103_base.yaml --config rtx3090_fp16 --max_step 200 --work_dir $workdir --txtlog_file train1.log \
+        --powersgd-rank 16 \
         "${@:3}"
 elif [[ "$1" == 'eval' ]]; then
     echo 'Run evaluation...'

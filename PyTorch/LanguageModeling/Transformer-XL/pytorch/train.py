@@ -32,6 +32,7 @@ import torch.optim as optim
 import yaml
 from apex import amp
 from torch.nn.parallel import DistributedDataParallel
+import torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook as powerSGD
 
 import lamb
 import utils
@@ -46,18 +47,24 @@ from utils.exp_utils import l2_promote
 from utils.exp_utils import log_env_info
 from utils.exp_utils import register_ignoring_timeout_handler
 
-import horovod.torch as hvd
+try:
+    import horovod.torch as hvd
+except ImportError:
+    print(
+        "Horovod is not installed"
+    )
 # import powersgd
 sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..', '..')))
 import Common.compressors as compressors
 import json
+
 
 def parse_args():
     parent_parser = argparse.ArgumentParser(
         description='PyTorch Transformer-XL Language Model',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         add_help=False,
-        )
+    )
 
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
     cfg_parser = argparse.ArgumentParser(parents=[parent_parser], add_help=False)
@@ -140,7 +147,7 @@ def parse_args():
                        help='Apply LayerNorm to the input instead of the output')
     model.add_argument('--attn_type', type=int, default=0,
                        help='Attention type. 0 for ours, 1 for Shaw et al,'
-                       '2 for Vaswani et al, 3 for Al Rfou et al.')
+                            '2 for Vaswani et al, 3 for Al Rfou et al.')
     model.add_argument('--not_tied', action='store_true',
                        help='Do not tie the word embedding and softmax weights')
     model.add_argument('--clamp_len', type=int, default=-1,
@@ -205,7 +212,7 @@ def parse_args():
                           to local_batch_size * world_size')
     training.add_argument('--batch_chunk', type=int, default=1,
                           help='Split batch into chunks and train with '
-                          'gradient accumulation')
+                               'gradient accumulation')
     training.add_argument('--roll', action='store_true',
                           help='Enable random shifts within each data stream')
     training.add_argument('--tgt_len', type=int, default=192,
@@ -237,11 +244,13 @@ def parse_args():
                      help='Evaluation interval')
 
     dist = parser.add_argument_group('distributed setup')
-    dist.add_argument('--local_rank',  type=int,
+    dist.add_argument('--local_rank', type=int,
                       default=os.getenv('LOCAL_RANK', 0),
                       help='Used for multi-process training.')
     parser.add_argument('--hvd', action='store_true',
                         help='Run using horovod')
+    parser.add_argument('--powersgd-rank', type=int, default=None,
+                        help='Rank of powersgd compression to run DDP with')
     parser.add_argument("--compression-type", type=str, default="none", choices=compressors.compression_types,
                         help="Compression Type (default: none)")
     parser.add_argument("--quantization-bits", type=int, default=4,
@@ -297,7 +306,7 @@ def save_checkpoint(args, model, model_config, optimizer, scheduler, vocab,
         'last_iter': last_iter,
         'train_step': train_step,
         'best_val_loss': best_val_loss,
-        }
+    }
 
     last_chkpt_fname = 'checkpoint_last.pt'
 
@@ -459,7 +468,7 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
     else:
         train_iter = tr_iter.get_fixlen_iter(start=last_iter)
 
-    for batch, (data, target, seq_len, _) in enumerate(train_iter, start=last_batch+1):
+    for batch, (data, target, seq_len, _) in enumerate(train_iter, start=last_batch + 1):
         log_step += 1
         target_tokens += target.numel()
 
@@ -537,25 +546,25 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
             target_tokens = 0
 
             log_str = '| epoch {:3d} step {:>8d} | batches {:>6d} / {:d} | lr {:.3e} ' \
-                '| ms/batch {:5.1f} | tok/s {:7.0f} | loss {:5.2f}'.format(
-                    epoch,
-                    train_step,
-                    batch,
-                    tr_iter.n_batch,
-                    lr,
-                    avg_elapsed * 1000,
-                    throughput,
-                    cur_loss,
-                    )
+                      '| ms/batch {:5.1f} | tok/s {:7.0f} | loss {:5.2f}'.format(
+                epoch,
+                train_step,
+                batch,
+                tr_iter.n_batch,
+                lr,
+                avg_elapsed * 1000,
+                throughput,
+                cur_loss,
+            )
 
             dllogger_data = {
                 'epoch': epoch,
-                'train_batch': batch+1,
+                'train_batch': batch + 1,
                 'lr': lr,
                 'train_time/batch': avg_elapsed * 1000,
                 'train_throughput': throughput,
                 'train_loss': cur_loss,
-                }
+            }
 
             if args.dataset in ['enwik8', 'text8']:
                 log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
@@ -573,7 +582,11 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
         interrupted = timeout_handler.interrupted
         if train_step > 0 and train_step % args.eval_interval == 0 and is_quantization_compression:
             d, sum = compression.get_metrics_magnitudes()
-            compression.adjust_bits()
+            if train_step == 10000:
+                compression.reset_metrics()
+                d, sum = compression.get_metrics_magnitudes()
+            else:
+                compression.adjust_bits()
             if d:
                 if args.local_rank == 0:
                     directory = os.path.join(args.work_dir, "adapt-logs")
@@ -595,16 +608,16 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
             logging.info('-' * 100)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
                       '| valid loss {:5.2f}'.format(
-                          train_step // args.eval_interval,
-                          train_step,
-                          (time.time() - eval_start_time),
-                          val_loss,
-                          )
+                train_step // args.eval_interval,
+                train_step,
+                (time.time() - eval_start_time),
+                val_loss,
+            )
 
             dllogger_data = {
                 'valid_elapsed': (time.time() - eval_start_time),
                 'valid_loss': val_loss,
-                }
+            }
 
             if args.dataset in ['enwik8', 'text8']:
                 log_str += ' | bpc {:9.5f}'.format(val_loss / math.log(2))
@@ -769,7 +782,7 @@ def main():
         'attn_type': args.attn_type,
         'clamp_len': args.clamp_len,
         'sample_softmax': args.sample_softmax,
-        }
+    }
 
     model = MemTransformerLM(**model_config)
 
@@ -841,7 +854,7 @@ def main():
             model,
             optimizer,
             opt_level=args.amp_mode,
-            )
+        )
 
     if args.multi_gpu == 'ddp' and torch.distributed.is_initialized():
         para_model = DistributedDataParallel(model,
@@ -850,6 +863,13 @@ def main():
                                              broadcast_buffers=False,
                                              find_unused_parameters=True,
                                              )
+        if args.powersgd_rank:
+            state = powerSGD.PowerSGDState(torch.distributed.group.WORLD,
+                                           matrix_approximation_rank=args.powersgd_rank, warm_start=True,
+                                           start_powerSGD_iter=10,
+                                           use_error_feedback=True)
+            para_model.register_comm_hook(state, powerSGD.powerSGD_hook)
+
     elif args.multi_gpu == 'dp':
         if args.gpu0_bsz >= 0:
             para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
@@ -883,24 +903,25 @@ def main():
             else:
                 return 1. / (step ** 0.5) if step > args.warmup_step \
                     else step / (args.warmup_step ** 1.5)
+
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         if args.sample_softmax > 0 and optimizer_sparse is not None:
             scheduler_sparse = optim.lr_scheduler.LambdaLR(
                 optimizer_sparse,
                 lr_lambda=lr_lambda
-                )
+            )
         else:
             scheduler_sparse = None
     elif args.scheduler == 'dev_perf':
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, factor=args.decay_rate, patience=args.patience,
             min_lr=args.lr_min,
-            )
+        )
         if args.sample_softmax > 0 and optimizer_sparse is not None:
             scheduler_sparse = optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer_sparse, factor=args.decay_rate, patience=args.patience,
                 min_lr=args.lr_min,
-                )
+            )
         else:
             scheduler_sparse = None
     elif args.scheduler == 'constant':
@@ -935,8 +956,8 @@ def main():
 
             if train_step >= args.max_step:
                 logging.info(f'Loaded checkpoint after {train_step} steps, but '
-                            f'this run was scheduled for a total of '
-                            f'{args.max_step} steps, exiting')
+                             f'this run was scheduled for a total of '
+                             f'{args.max_step} steps, exiting')
                 sys.exit(1)
             model.apply(functools.partial(update_dropout, args=args))
             model.apply(functools.partial(update_dropatt, args=args))
@@ -963,7 +984,7 @@ def main():
                     optimizer, optimizer_sparse, scheduler, scheduler_sparse,
                     vocab, epoch, last_batch, last_iter, train_step,
                     best_val_loss, meters, timeout_handler, args, compression
-                    )
+                )
 
                 last_batch = 0
                 last_iter = 0
@@ -1005,7 +1026,7 @@ def main():
         summary.update({
             'test_elapsed': test_elapsed,
             'test_loss': test_loss,
-            })
+        })
 
         if args.dataset in ['enwik8', 'text8']:
             summary['test_bits_per_character'] = test_loss / math.log(2)
@@ -1026,7 +1047,7 @@ def main():
         'train_elapsed': elapsed / 60,
         'valid_loss': best_val_loss,
         'valid_perplexity': val_perplexity,
-        })
+    })
     dllogger.log(step=tuple(), data=summary)
 
     passed = benchmark(
@@ -1034,7 +1055,7 @@ def main():
         test_perplexity=val_perplexity,
         target_throughput=args.target_throughput,
         test_throughput=meters['train_throughput'].avg
-        )
+    )
     if not passed:
         sys.exit(1)
 

@@ -347,6 +347,8 @@ def add_parser_arguments(parser):
                         help="Warm up period for compressor")
     parser.add_argument("--local_rank", type=int, default=0,
                         help="local rank")
+    parser.add_argument('--powersgd-rank', type=int, default=None,
+                        help='Rank of powersgd compression to run DDP with')
 
 
 def count_parameters(model):
@@ -592,14 +594,13 @@ def main(args):
         )
 
     if args.distributed:
-        model_and_loss.distributed(hvd_dist=args.hvd, fake_comp_ratio=1.0)
+        model_and_loss.distributed(powersgd_rank=args.powersgd_rank)
     if is_root:
         print("Model size {}".format(count_parameters(model_and_loss)))
     model_and_loss.load_model_state(model_state)
     if args.hvd and hvd.size() > 1:
         hvd.broadcast_parameters(model_and_loss.model.state_dict(), root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-
     train_loop(
         model_and_loss,
         optimizer,

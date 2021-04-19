@@ -349,7 +349,7 @@ def add_parser_arguments(parser):
                         help="local rank")
     parser.add_argument('--powersgd-rank', type=int, default=None,
                         help='Rank of powersgd compression to run DDP with')
-    parser.add_argument('--search', action='store_true', default=True, help='Invoke differential evolution search')
+    parser.add_argument('--search', action='store_true', default=False, help='Invoke differential evolution search')
     parser.add_argument('--search-alpha', type=float, default=0.5, help="Power compression error is raised to minimize objective function")
     parser.add_argument('--search-beta', type=float, default=0.5, help="Power compression ratio is raised to minimize objective function")
     parser.add_argument('--search-max-bits', type=int, default=8, help="Maximum bit-width to compress the gradients")

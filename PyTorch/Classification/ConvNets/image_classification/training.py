@@ -623,11 +623,20 @@ def train_loop(
                 d, sum = compression.get_metrics_magnitudes()
             else:
                 if search:
-                    objective_fn = partial(compression.adjust_bits_search_de, alpha=search_alpha, beta=search_beta, search_max_bits=search_max_bits, search_min_bits=search_min_bits)
-                    lw = [0.0] * len(list(compression.states.items()))
-                    hw = [1.0] * len(lw)
-                    result = optimize.differential_evolution(objective_fn, bounds=list(zip(lw, hw)), popsize=search_popsize, maxiter=search_iterations, seed=42, polish=False)
-                    compression.set_bits_from_search(list(result.x))
+                    if hvd.rank() == 0:
+                        objective_fn = partial(compression.adjust_bits_search_de, alpha=search_alpha, beta=search_beta, search_max_bits=search_max_bits, search_min_bits=search_min_bits)
+                        lw = [0.0] * len(list(compression.states.items()))
+                        hw = [1.0] * len(lw)
+                        result = optimize.differential_evolution(objective_fn, bounds=list(zip(lw, hw)), popsize=search_popsize, maxiter=search_iterations, seed=42, polish=False)
+                        ratios = list(result.x)
+                        hvd.broadcast_object(ratios, root_rank=0, name='ratios')
+                        bits = compression.set_bits_from_search(list(result.x), search_max_bits, search_min_bits)
+                        print("Bits: ", bits)
+                    else:
+                        ratios = {}
+                        ratios = hvd.broadcast_object(ratios, root_rank=0, name='ratios')
+
+                    
                 else:
                     compression.adjust_bits()
             if d:

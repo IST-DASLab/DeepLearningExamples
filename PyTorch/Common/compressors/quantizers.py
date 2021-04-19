@@ -87,6 +87,41 @@ class Quantizer(Compressor):
                 bits = int(self.bits_min + unit * value)
             state["bits"] = bits
 
+    def set_bits_from_search(self, amounts):
+        layers_bits = amounts
+        max_value = 0.0
+        for p in self.states.keys():
+            value = self._get_metric(p)
+            if value == float("inf") or value != value or value < 1e-10:
+                # don't take this value into account
+                continue
+            max_value = max(value, max_value)
+
+        assert len(layers_bits) == len(list(self.states.items())), "Mismatch: Layer bits {} Parameters {}".format(len(self.layers_bits), len(list(self.state.items())))
+        for i, (p, state) in enumerate(self.states.items()):
+            value = self._get_metric(p, compute=False)
+            state["bits"] = round(1.5 + layers_bits[i] * 7) # Bits = round(2(bmin) -0.5 + ratio * (8bmax - 2(bmin) + 1) ) maximum 8 bits, minimum 2 bits.
+
+    def adjust_bits_search_de(self, amounts, alpha, beta, search_max_bits, search_min_bits):
+        layers_bits = amounts
+        max_value = 0.0
+        for p in self.states.keys():
+            value = self._get_metric(p)
+            if value == float("inf") or value != value or value < 1e-10:
+                # don't take this value into account
+                continue
+            max_value = max(value, max_value)
+
+        assert len(layers_bits) == len(list(self.states.items())), "Mismatch: Layer bits {} Parameters {}".format(len(self.layers_bits), len(list(self.state.items())))
+        for i, (p, state) in enumerate(self.states.items()):
+            value = self._get_metric(p, compute=False)
+            state["bits"] = round(search_min_bits - 0.5 + layers_bits[i] * (search_max_bits - search_min_bits + 1)) # Bits = round(2(bmin) -0.5 + ratio * (8bmax - 2(bmin) + 1) ) maximum 8 bits, minimum 2 bits.
+
+        errors = sum([float(self._get_metric(p)) for p in self.states.keys()])
+        compression_ratio = float(self._get_compression_ratio())
+        print("Searching .... Amounts: {} Reward: {}".format(amounts, (errors**alpha) * (compression_ratio**beta)))
+        return (errors**alpha) * (compression_ratio**beta)
+
     def get_metrics_magnitudes(self):
         d = {}
         sum = 0.0
@@ -96,6 +131,15 @@ class Quantizer(Compressor):
                     d[name] = self._get_metric(p)
                     sum += d[name]
         return d, sum
+
+    def _get_compression_ratio(self):
+        numerator = 0.
+        denominator = 0.
+        for p, state in self.states.items():
+            numerator += float(state["bits"] * p.grad.numel())
+            denominator += float(32 * p.grad.numel())
+
+        return numerator / denominator
 
     def get_compression_scheme(self):
         d = {32: self.excluded_layer_names.copy()}

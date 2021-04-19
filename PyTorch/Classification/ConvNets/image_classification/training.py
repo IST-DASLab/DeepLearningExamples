@@ -36,6 +36,8 @@ from torch.autograd import Variable
 from . import logger as log
 from . import resnet as models
 from . import utils
+from scipy import optimize
+from functools import partial
 import dllogger
 
 try:
@@ -555,7 +557,14 @@ def train_loop(
         checkpoint_dir="./",
         checkpoint_filename="checkpoint.pth.tar",
         bb_settings=None,
-        compression=None
+        compression=None,
+        search=False,
+        search_alpha=0.5,
+        search_beta=0.5,
+        search_max_bits=8,
+        search_min_bits=2,
+        search_popsize=2,
+        search_iterations=2
 ):
     prec1 = -1
     root = False
@@ -613,7 +622,14 @@ def train_loop(
                 compression.reset_metrics()
                 d, sum = compression.get_metrics_magnitudes()
             else:
-                compression.adjust_bits()
+                if search:
+                    objective_fn = partial(compression.adjust_bits_search_de, alpha=search_alpha, beta=search_beta, search_max_bits=search_max_bits, search_min_bits=search_min_bits)
+                    lw = [0.0] * len(list(compression.states.items()))
+                    hw = [1.0] * len(lw)
+                    result = optimize.differential_evolution(objective_fn, bounds=list(zip(lw, hw)), popsize=search_popsize, maxiter=search_iterations, seed=42, polish=False)
+                    compression.set_bits_from_search(list(result.x))
+                else:
+                    compression.adjust_bits()
             if d:
                 directory = os.path.join(checkpoint_dir, "adapt_logs".format(compression.bits))
                 os.makedirs(directory, exist_ok=True)

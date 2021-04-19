@@ -349,6 +349,13 @@ def add_parser_arguments(parser):
                         help="local rank")
     parser.add_argument('--powersgd-rank', type=int, default=None,
                         help='Rank of powersgd compression to run DDP with')
+    parser.add_argument('--search', action='store_true', default=True, help='Invoke differential evolution search')
+    parser.add_argument('--search-alpha', type=float, default=0.5, help="Power compression error is raised to minimize objective function")
+    parser.add_argument('--search-beta', type=float, default=0.5, help="Power compression ratio is raised to minimize objective function")
+    parser.add_argument('--search-max-bits', type=int, default=8, help="Maximum bit-width to compress the gradients")
+    parser.add_argument('--search-min-bits', type=int, default=2, help="Minimum bit-width to compress the gradients")
+    parser.add_argument('--popsize', type=int, default=5, help="Population size")
+    parser.add_argument('--search-iterations', type=int, default=2, help="Number of iterations - \n Total iterations = (search_iterations+1)*popsize*num_layers")
 
 
 def count_parameters(model):
@@ -624,7 +631,14 @@ def main(args):
         checkpoint_dir=args.workspace,
         checkpoint_filename=args.checkpoint_filename,
         bb_settings=bb_settings,
-        compression=compression
+        compression=compression,
+        search=args.search,
+        search_alpha=args.search_alpha,
+        search_beta=args.search_beta,
+        search_max_bits=args.search_max_bits,
+        search_min_bits=args.search_min_bits,
+        search_popsize=args.popsize,
+        search_iterations=args.search_iterations
     )
     exp_duration = time.time() - exp_start_time
     if is_root:

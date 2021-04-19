@@ -1,9 +1,10 @@
-NUM_NODES=8
+NUM_NODES=4
 raport_file="raport.json"
-dataset_path=/nvmedisk/Datasets/ILSVRC/Data/CLS-LOC/
+#dataset_path=/nvmedisk/Datasets/ILSVRC/Data/CLS-LOC/
 #dataset_path=/nfs/scistore14/alistgrp/imarkov/Datasets/imagewoof
-BATCH_SIZE=256
-#BATCH_SIZE=32
+dataset_path=/nfs/scistore14/alistgrp/imarkov/Datasets/imagenet/
+#BATCH_SIZE=256
+BATCH_SIZE=32
 rm -rf ~/.horovod
 lr=`echo "print($BATCH_SIZE * $NUM_NODES * 0.001)" | python`
 q=1

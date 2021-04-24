@@ -1,1 +1,1 @@
-from .compressors import CompressedSGDBig, get_compressor, DGCompressor, compression_types
+from .compressors import CompressedSGDBig, get_compressor, compression_types

@@ -275,8 +275,6 @@ def get_train_step(
                     optimizer.synchronize()
         else:
             loss.backward()
-        if issubclass(type(compression), compressors.Quantizer):
-            compression.update_metric_stats(model_and_loss.model.parameters())
         if optimizer_step:
             opt = (
                 optimizer.optimizer
@@ -293,6 +291,8 @@ def get_train_step(
                     optimizer.step()
             else:
                 optimizer.step()
+            if issubclass(type(compression), compressors.Quantizer):
+                compression.update_metric_stats(model_and_loss.model.parameters())
             optimizer.zero_grad()
 
         torch.cuda.synchronize()

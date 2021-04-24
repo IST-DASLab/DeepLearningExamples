@@ -30,7 +30,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import yaml
-from apex import amp
 from torch.nn.parallel import DistributedDataParallel
 import torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook as powerSGD
 
@@ -46,14 +45,18 @@ from utils.exp_utils import create_exp_dir
 from utils.exp_utils import l2_promote
 from utils.exp_utils import log_env_info
 from utils.exp_utils import register_ignoring_timeout_handler
+import warnings
 
 try:
     import horovod.torch as hvd
 except ImportError:
-    print(
-        "Horovod is not installed"
-    )
-# import powersgd
+    warnings.warn('Horovod is unavailable')
+
+try:
+    from apex import amp
+except ModuleNotFoundError:
+    warnings.warn('APEX AMP is unavailable')
+
 sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..', '..')))
 import Common.compressors as compressors
 import json
@@ -116,6 +119,15 @@ def parse_args():
     general.add_argument('--amp_mode', type=str, default='O2',
                          choices=['O0', 'O1', 'O2', 'O3'],
                          help='Optimization level for apex amp')
+    general.add_argument('--amp', choices=['apex', 'pytorch'], default='apex',
+                         help='Implementation of automatic mixed precision')
+    general.add_argument('--affinity', type=str,
+                     default='socket_unique_interleaved',
+                     choices=['socket', 'single', 'single_unique',
+                              'socket_unique_interleaved',
+                              'socket_unique_continuous',
+                              'disabled'],
+                     help='type of CPU affinity')
 
     dataset = parser.add_argument_group('dataset setup')
     dataset.add_argument('--data', type=str, default='../data/wikitext-103',
@@ -285,11 +297,14 @@ def parse_args():
     return args
 
 
-def save_checkpoint(args, model, model_config, optimizer, scheduler, vocab,
+def save_checkpoint(args, model, model_config, optimizer, scheduler, scaler, vocab,
                     epoch, batch, last_iter, train_step, best_val_loss,
                     is_best, work_dir):
     if args.fp16:
-        amp_state = amp.state_dict()
+        if args.amp == 'pytorch':
+            amp_state = scaler.state_dict()
+        elif args.amp == 'apex':
+            amp_state = amp.state_dict()
     else:
         amp_state = None
 
@@ -451,7 +466,7 @@ def evaluate(eval_iter, model, args):
 
 
 def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
-          optimizer_sparse, scheduler, scheduler_sparse, vocab, epoch,
+          optimizer_sparse, scheduler, scheduler_sparse, scaler, vocab, epoch,
           last_batch, last_iter, train_step, best_val_loss, meters,
           timeout_handler, args, compression):
     # Turn on training mode which enables dropout.
@@ -480,26 +495,50 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
         for i in range(args.batch_chunk):
             data_i = data_chunks[i].contiguous()
             target_i = target_chunks[i].contiguous()
-            loss, mems[i] = para_model(data_i, target_i, mems[i])
-            loss = loss.float().mean().type_as(loss) / args.batch_chunk
+            enable_autocast = args.fp16 and args.amp == 'pytorch'
+            with torch.cuda.amp.autocast(enable_autocast):
+                loss, mems[i] = para_model(data_i, target_i, mems[i])
+                loss = loss.float().mean().type_as(loss) / args.batch_chunk
+
             if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                    # if args.hvd and i == args.batch_chunk - 1:
+                if args.amp == 'pytorch':
+                    scaler.scale(loss).backward()
                     if args.hvd:
                         optimizer.synchronize()
+                elif args.amp == 'apex':
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                        # if args.hvd and i == args.batch_chunk - 1:
+                        if args.hvd:
+                            optimizer.synchronize()
             else:
                 loss.backward()
 
             train_loss += loss.float().item()
 
         if args.fp16:
-            torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
+            if args.amp == 'pytorch':
+                scaler.unscale()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+            else:
+                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        if args.hvd and args.fp16:
-            with optimizer.skip_synchronize():
-                optimizer.step()
+        if args.fp16:
+            if args.amp == "pytorch":
+                if args.hvd:
+                    with optimizer.skip_synchronize():
+                        scaler.step(optimizer)
+                        scaler.update()
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
+            else:
+                if args.hvd:
+                    with optimizer.skip_synchronize():
+                        optimizer.step()
+                else:
+                    optimizer.step()
         else:
             optimizer.step()
         if optimizer_sparse:
@@ -667,7 +706,14 @@ def main():
     if args.hvd:
         utils.distributed.init_hvd()
         args.local_rank = utils.distributed.get_rank()
-    utils.gpu_affinity.set_affinity(args.local_rank)
+    if args.affinity != 'disabled':
+        nproc_per_node = torch.cuda.device_count()
+        affinity = utils.gpu_affinity.set_affinity(
+            args.local_rank,
+            nproc_per_node,
+            args.affinity
+        )
+        print(f'{args.local_rank}: thread affinity: {affinity}')
     # Initialize device and distributed backend
     torch.cuda.set_device(args.local_rank)
     l2_promote()
@@ -849,12 +895,16 @@ def main():
         hvd.broadcast_parameters(model.state_dict(), root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
+    scaler = None
     if args.fp16:
-        model, optimizer = amp.initialize(
-            model,
-            optimizer,
-            opt_level=args.amp_mode,
-        )
+        if args.amp == 'pytorch':
+            scaler = torch.cuda.amp.GradScaler()
+        elif args.amp == 'apex':
+            model, optimizer = amp.initialize(
+                model,
+                optimizer,
+                opt_level=args.apex_amp_opt_level,
+            )
 
     if args.multi_gpu == 'ddp' and torch.distributed.is_initialized():
         para_model = DistributedDataParallel(model,
@@ -947,7 +997,10 @@ def main():
             optimizer.load_state_dict(checkpoint['optimizer_state'])
             scheduler.load_state_dict(checkpoint['scheduler_state'])
             if args.fp16:
-                amp.load_state_dict(checkpoint['amp_state'])
+                if args.amp == 'pytorch':
+                    scaler.load_state_dict(checkpoint['amp_state'])
+                elif args.amp == 'apex':
+                    amp.load_state_dict(checkpoint['amp_state'])
             train_step = checkpoint['train_step']
             start_epoch = checkpoint['epoch']
             last_batch = checkpoint['batch']
@@ -981,7 +1034,7 @@ def main():
                     tr_iter.roll(seed=args.seed + epoch)
                 train_step, best_val_loss = train(
                     tr_iter, va_iter, model, para_model, model_config,
-                    optimizer, optimizer_sparse, scheduler, scheduler_sparse,
+                    optimizer, optimizer_sparse, scheduler, scheduler_sparse, scaler,
                     vocab, epoch, last_batch, last_iter, train_step,
                     best_val_loss, meters, timeout_handler, args, compression
                 )
@@ -1073,5 +1126,6 @@ if __name__ == "__main__":
     # Otherwise it'll default to "promote" mode, and we'll get fp32 operations.
     # Note that running `--amp_mode O2` will remove the need for this
     # code, but it is still valid.
-    amp.register_half_function(torch, 'einsum')
+    if 'apex' in sys.modules:
+        amp.register_half_function(torch, 'einsum')
     main()

@@ -7,7 +7,7 @@ class Quantizer(Compressor):
     def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None):
         super().__init__()
         self.bits = bits
-        self.bits_min = 4
+        self.bits_min = 3
         self.bits_max = 8
         self.bits_default = bits
         self.num_levels = 1 << bits
@@ -67,6 +67,8 @@ class Quantizer(Compressor):
         # return state["error_correction"].norm(p=2).item()
 
     def adjust_bits(self):
+        if not self.states:
+            return
         max_value = 0.0
         for p in self.states.keys():
             value = self._get_metric(p)

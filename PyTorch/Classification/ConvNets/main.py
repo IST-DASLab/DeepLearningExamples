@@ -349,6 +349,10 @@ def add_parser_arguments(parser):
                         help="local rank")
     parser.add_argument('--powersgd-rank', type=int, default=None,
                         help='Rank of powersgd compression to run DDP with')
+    parser.add_argument('--adapt-compression-adjust-freq', type=int, default=1,
+                        help='Adaptive compression. Frequency in epochs to perform bits adjustment.')
+    parser.add_argument('--adapt-compression-reset-freq', type=int, default=10,
+                        help='Adaptive compression. Frequency in epochs to reset stats.')
 
 
 def count_parameters(model):
@@ -624,7 +628,8 @@ def main(args):
         checkpoint_dir=args.workspace,
         checkpoint_filename=args.checkpoint_filename,
         bb_settings=bb_settings,
-        compression=compression
+        compression=compression,
+        args=args
     )
     exp_duration = time.time() - exp_start_time
     if is_root:

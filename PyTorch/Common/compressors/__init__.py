@@ -1,7 +1,7 @@
-from .quantizers import Quantizer, MaxMinQuantizer, ExponentialQuantizer, OneBitQuantizer, SanityQuantizer, NormUniformQuantizer, TernGrad, QuantileQuantizer
+from .quantizers import Quantizer, MaxMinQuantizer, ExponentialQuantizer, OneBitQuantizer, SanityQuantizer, NormUniformQuantizer, TernGrad, QuantileQuantizer, ThreeLC
 from .topk_compressor import TopKCompressor, TopKRMSProp, TopKCompressorBig
 from .CompressedSGDFull import CompressedSGDBig
-compression_types = ["none", "sanity", "maxmin", "exponential", "1bit", "norm_uniform", "terngrad", "topk", "topk_rmsprop", "svd", "stats", "quantile"]
+compression_types = ["none", "sanity", "maxmin", "exponential", "1bit", "norm_uniform", "terngrad", "topk", "topk_rmsprop", "svd", "stats", "quantile", "3LC"]
 
 import os
 import horovod.torch as hvd
@@ -20,17 +20,19 @@ def get_compressor(args, named_parameters):
         if args.compression_type == "maxmin":
             return MaxMinQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback, named_parameters)
         elif args.compression_type == "exponential":
-            return ExponentialQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback)
+            return ExponentialQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback, named_parameters)
         elif args.compression_type == "norm_uniform":
             return NormUniformQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback)
         if args.compression_type == "terngrad":
-            return TernGrad(args.bucket_size, args.error_feedback)
+            return TernGrad(args.bucket_size, args.error_feedback, named_parameters)
         elif args.compression_type == "sanity":
             return SanityQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback)
         elif args.compression_type == "1bit":
             return OneBitQuantizer(args.bucket_size, args.error_feedback)
         elif args.compression_type == "quantile":
             return QuantileQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback)
+        elif args.compression_type == "3LC":
+            return ThreeLC(args.bucket_size, named_parameters)
 
         if not args.big_grad:
             if "topk" in args.compression_type:

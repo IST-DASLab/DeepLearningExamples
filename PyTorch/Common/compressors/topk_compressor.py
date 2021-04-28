@@ -27,7 +27,7 @@ class TopKCompressorBig(Compressor):
             grad.add_(e_c)
             e_c.copy_(grad)
 
-        self._zero(grad)
+        self._sparcify(grad)
 
         if self.enable_error_correction:
             e_c.sub_(grad)
@@ -43,7 +43,7 @@ class TopKCompressorBig(Compressor):
             idx = idx[torch.randperm(idx.numel())[:zero_k]]
         return idx
 
-    def _zero(self, grad):
+    def _sparcify(self, grad):
         idx = self._topk(grad)
         if self.ef_q is not None and self.ef_q["rand_k"] is None:
             values = grad.gather(0, idx)
@@ -163,7 +163,7 @@ class TopKCompressor(Compressor):
             e_c.copy_(grad)
 
         grad_ = grad.view(-1)
-        self._zero(grad_)
+        self._sparcify(grad_)
 
         if self.enable_error_correction:
             e_c = state["error_correction"]
@@ -177,7 +177,7 @@ class TopKCompressor(Compressor):
         _, idx = sort[:num_zero], indices[:num_zero]
         return idx
 
-    def _zero(self, grad):
+    def _sparcify(self, grad):
         idx = self._topk(grad)
         if self.ef_q is not None and self.ef_q["rand_k"] is None:
             values = grad.gather(0, idx)

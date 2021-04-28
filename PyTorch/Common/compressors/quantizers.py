@@ -1,29 +1,45 @@
 import torch
 from .compressor import Compressor
 import horovod.torch as hvd
-
+from .adjuster import LinearAdjuster, BayesianAdjuster
 
 class Quantizer(Compressor):
-    def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None):
+    def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None, adaptive=False):
         super().__init__()
         self.bits = bits
-        self.bits_min = 3
+        self.bits_min = 1
         self.bits_max = 8
         self.bits_default = bits
         self.num_levels = 1 << bits
         self.bucket_size = bucket_size
         self.states = {}
         self.save_error_correction = enable_error_correction
-        self.apply_error_correction = False
-        self.bit_levels = [self.bits]
+        if adaptive:
+            self.apply_error_correction = False
+        else:
+            self.apply_error_correction = enable_error_correction
         self.momentum_acc = 0.8
         self.excluded_layer_names = ["layer_norm", "bias", "bn"]
+        self.is_adaptive = adaptive
+        self.adjuster = BayesianAdjuster(self)
         if named_parameters:
             named_parameters = list(named_parameters)
             self.named_parameters = {p: name for name, p in named_parameters if p.requires_grad}
             self.parameters_sizes = {name: p.numel() for name, p in named_parameters if p.requires_grad}
             self.parameters_qbits = {}
-            # self.exact_match = {name: False for name in named_parameters}
+            for name, p in named_parameters:
+                if not p.requires_grad:
+                    continue
+                skip_layer = False
+                for excluded_name in self.excluded_layer_names:
+                    if excluded_name in name:
+                        skip_layer = True
+                        break
+                if skip_layer:
+                    continue
+                self.states[p] = {}
+                self.states[p]["bits"] = self.bits
+        # self.exact_match = {name: False for name in named_parameters}
             # for i in range(len(named_parameters)):
             #     for j in range(i + 1, len(named_parameters)):
             #         if named_parameters[i] in named_parameters[j]:
@@ -38,10 +54,13 @@ class Quantizer(Compressor):
 
     def reset_metrics(self):
         for p, state in self.states.items():
-            state["momentum"].fill_(0.0)
+            if "momentum" in state:
+                state["momentum"].fill_(0.0)
             state["bits"] = self.bits_default
 
     def update_metric_stats(self, parameters):
+        if not self.is_adaptive:
+            return
         for p in parameters:
             if not p.requires_grad or p not in self.states:
                 continue
@@ -51,13 +70,13 @@ class Quantizer(Compressor):
                 d_p = d_p.float()
             if "momentum" not in state:
                 state["momentum"] = torch.zeros_like(d_p)
-            state["momentum"].mul_(self.momentum_acc).add_(d_p)
+            state["momentum"].add_(d_p)
 
-    def _get_metric(self, p, compute=True):
+    def get_metric(self, p, compute=True):
         state = self.states[p]
         if compute:
             buf = state["momentum"]
-            self.set_compression_parameters(p)
+            self.set_num_levels(p)
             if torch.isinf(buf).sum() > 0:
                 state["compression_error"] = float("inf")
             else:
@@ -67,39 +86,31 @@ class Quantizer(Compressor):
         # return state["error_correction"].norm(p=2).item()
 
     def adjust_bits(self):
-        if not self.states:
+        if not self.states or not self.is_adaptive:
             return
-        max_value = 0.0
-        for p in self.states.keys():
-            value = self._get_metric(p)
-            if value == float("inf") or value != value or value < 1e-10:
-                # don't take this value into account
-                continue
-            max_value = max(value, max_value)
-        unit = (self.bits_max - self.bits_min) / max_value
+        if hvd.rank() == 0:
+            best_bits = self.adjuster.fit_predict(self.states, self.bits_min, self.bits_max)
+            hvd.broadcast_object(best_bits, root_rank=0)
+        else:
+            best_bits = []
+            best_bits = hvd.broadcast_object(best_bits, root_rank=0)
+        self.set_bits_states(best_bits)
         for p, state in self.states.items():
-            value = self._get_metric(p, compute=False)
-            if value < 1e-10:
-                # if wasn't compressed
-                bits = 32
-            elif value == float("inf") or value != value:
-                # if gradient explodes or metric equal to NaN
-                bits = self.bits_default
-            else:
-                bits = int(self.bits_min + unit * value)
-            state["bits"] = bits
+            state["momentum"].mul_(self.momentum_acc)
 
     def get_metrics_magnitudes(self):
         d = {}
         sum = 0.0
-        if self.named_parameters:
+        if self.named_parameters and self.is_adaptive:
             for p, name in self.named_parameters.items():
                 if p in self.states:
-                    d[name] = self._get_metric(p)
+                    d[name] = self.get_metric(p)
                     sum += d[name]
         return d, sum
 
     def get_compression_scheme(self):
+        if not self.is_adaptive:
+            return
         d = {32: self.excluded_layer_names.copy()}
         for p, state in self.states.items():
             name = self.named_parameters[p]
@@ -110,7 +121,12 @@ class Quantizer(Compressor):
                 d[bits] = [name]
         return d
 
-    def set_compression_parameters(self, p):
+    def set_bits_states(self, bits):
+        assert len(bits) == len(self.states)
+        for bit, (p, state) in zip(bits, self.states.items()):
+            state["bits"] = bit
+
+    def set_num_levels(self, p):
         bits = self.states[p]["bits"]
         self.num_levels = 1 << bits
 
@@ -129,16 +145,14 @@ class Quantizer(Compressor):
                     return p.grad, None
         d_p = p.grad.data
         if p.grad.data.dtype == torch.float16:
+            self.adjuster.set_original_bits(16)
             d_p = d_p.float()
 
-        if p not in self.states:
-            self.states[p] = {}
-            self.states[p]["error_correction"] = torch.zeros_like(d_p)
-            self.states[p]["bits"] = self.bits
         state = self.states[p]
-        e_c = state["error_correction"]
-
         if self.save_error_correction:
+            if "error_correction" not in state:
+                state["error_correction"] = torch.zeros_like(d_p)
+            e_c = state["error_correction"]
             # update error correction before subtraction
             if self.momentum_acc:
                 e_c.mul_(self.momentum_acc)
@@ -146,7 +160,7 @@ class Quantizer(Compressor):
             # add error correction
             if self.apply_error_correction:
                 d_p.copy_(e_c)
-        self.set_compression_parameters(p)
+        self.set_num_levels(p)
         self._compress(d_p)
         if self.save_error_correction:
             e_c.sub_(d_p)
@@ -237,7 +251,7 @@ class Quantizer(Compressor):
 
 class MaxMinQuantizer(Quantizer):
     def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None):
-        super().__init__(bits, bucket_size, enable_error_correction, named_parameters)
+        super().__init__(bits, bucket_size, enable_error_correction, named_parameters, True)
 
     def quantize_bucket(self, a):
         if self.num_levels == 1 << 32 or torch.isinf(a).sum() > 0:
@@ -266,8 +280,8 @@ class MaxMinQuantizer(Quantizer):
 
 
 class ExponentialQuantizer(Quantizer):
-    def __init__(self, bits, bucket_size, enable_error_correction=False):
-        super().__init__(bits, bucket_size, enable_error_correction)
+    def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None):
+        super().__init__(bits, bucket_size, enable_error_correction, named_parameters)
         self.num_levels = self.num_levels // 2
         self.norm_type = float("inf")
         self.levels_1dim = torch.tensor([0.5 ** i for i in range(self.num_levels, 0, -1)])
@@ -301,8 +315,7 @@ class ExponentialQuantizer(Quantizer):
             s = torch.Tensor([1e-11]).to(a.device)
         vnorm = torch.max(vnorm, s)
         sign = torch.sign(a)
-        sign.add_(1).div_(2)
-        sign.mul_(2).add_(-1)
+        sign[sign == 0.0] = 1.0
         if self.num_levels <= 1:
             return vnorm * sign
         a = torch.abs(a / vnorm)
@@ -355,7 +368,6 @@ class NormUniformQuantizer(Quantizer):
         else:
             vnorm = torch.norm(a, p=float("inf"))
             s = torch.Tensor([1e-11]).to(a.device)
-
         vnorm = torch.max(vnorm, s)
         sign = torch.sign(a)
         # cast sign to 1 bit
@@ -398,21 +410,48 @@ class QuantileQuantizer(Quantizer):
 
 
 class TernGrad(Quantizer):
-    def __init__(self, bucket_size, enable_error_correction=False):
-        super().__init__(2, bucket_size, enable_error_correction)
+    def __init__(self, bucket_size, enable_error_correction=False, named_parameters=None):
+        super().__init__(2, bucket_size, enable_error_correction, named_parameters)
+        self.clip_constant = 2.5
+
+    def quantize_bucket(self, a):
+        sign = torch.sign(a)
+        sign[sign == 0.0] = 1.0
+        a.abs_()
+        sigma = torch.std(a) * self.clip_constant
+        torch.min(a, sigma, out=a)
+        if a.dim() == 2:
+            vnorm = torch.norm(a, p=float("inf"), dim=1)
+            vnorm = vnorm[:, None]
+            s = torch.Tensor([1e-11]).expand_as(vnorm).to(a.device)
+        else:
+            s = torch.Tensor([1e-11]).to(a.device)
+            vnorm = torch.norm(a, p=float("inf")).expand_as(s)
+        torch.max(vnorm, s, out=vnorm)
+        r = torch.rand(a.shape, device=a.device)
+        a.div_(vnorm).add_(r)
+        torch.floor_(a)
+        a.mul_(sign).mul_(vnorm)
+        return a
+
+class ThreeLC(Quantizer):
+    def __init__(self, bucket_size, named_parameters=None):
+        super(ThreeLC, self).__init__(2, bucket_size, True, named_parameters)
 
     def quantize_bucket(self, a):
         if a.dim() == 2:
-            vnorm = torch.norm(a, p=float("inf"), dim=0)
-            vnorm = vnorm[None, :]
+            vnorm = torch.norm(a, p=float("inf"), dim=1)
+            vnorm = vnorm[:, None]
             s = torch.Tensor([1e-11]).expand_as(vnorm).to(a.device)
         else:
-            vnorm = torch.norm(a, p=float("inf"))
             s = torch.Tensor([1e-11]).to(a.device)
+            vnorm = torch.norm(a, p=float("inf")).expand_as(s)
         torch.max(vnorm, s, out=vnorm)
-        sign = torch.sign(a)
-        sign[sign == 0.0] = 1.0
-        return vnorm * sign
+        a.div_(vnorm)
+        # do rounding
+        a.add_(0.5)
+        torch.floor_(a)
+        return a.mul_(vnorm)
 
 
 class OneBitQuantizer(Quantizer):

@@ -116,7 +116,7 @@ def parse_args():
                          help='Target training throughput (for benchmarking)')
     general.add_argument('--target_perplexity', type=float, default=None,
                          help='Target validation perplexity (for benchmarking)')
-    general.add_argument('--amp_mode', type=str, default='O2',
+    general.add_argument('--apex_amp_opt_level', type=str, default='O2',
                          choices=['O0', 'O1', 'O2', 'O3'],
                          help='Optimization level for apex amp')
     general.add_argument('--amp', choices=['apex', 'pytorch'], default='apex',
@@ -518,7 +518,7 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
 
         if args.fp16:
             if args.amp == 'pytorch':
-                scaler.unscale()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             else:
                 torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
@@ -621,9 +621,9 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
         interrupted = timeout_handler.interrupted
         if train_step > 0 and train_step % args.eval_interval == 0 and is_quantization_compression:
             d, sum = compression.get_metrics_magnitudes()
-            if train_step == 10000:
+            if train_step % 10000 == 0:
                 compression.reset_metrics()
-                d, sum = compression.get_metrics_magnitudes()
+                # d, sum = compression.get_metrics_magnitudes()
             else:
                 compression.adjust_bits()
             if d:
@@ -679,7 +679,7 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
 
             if not args.debug:
                 save_checkpoint(args, model, model_config, optimizer,
-                                scheduler, vocab, epoch, batch, last_iter,
+                                scheduler, scaler, vocab, epoch, batch, last_iter,
                                 train_step, best_val_loss, is_best,
                                 args.work_dir)
 
@@ -705,7 +705,7 @@ def main():
     args = parse_args()
     if args.hvd:
         utils.distributed.init_hvd()
-        args.local_rank = utils.distributed.get_rank()
+        args.local_rank = hvd.local_rank()
     if args.affinity != 'disabled':
         nproc_per_node = torch.cuda.device_count()
         affinity = utils.gpu_affinity.set_affinity(

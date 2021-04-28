@@ -19,9 +19,9 @@ bucket_size=1024
 
 compression_config_file="--compression-config-filename config_compress.yaml"
 #compression_config_file=""
-
+BATCH_SIZE=$(( 32 * $NUM_NODES ))
 echo 'Run training...'
-for type in SRA; do
+for type in none; do
 #  workdir="workdir_quan/${type}_${q}_${bucket_size}"
   workdir="workdir_topk/test"
   mkdir -p $workdir
@@ -34,6 +34,7 @@ for type in SRA; do
       --config_file wt103_base.yaml \
       --config rtx3090_fp16 \
       --hvd \
+      --batch_size $BATCH_SIZE \
       --work_dir $workdir \
       --dllog_file train_log.json --txtlog_file train_log.log \
       --max_step 200 --debug \

@@ -555,7 +555,8 @@ def train_loop(
         checkpoint_dir="./",
         checkpoint_filename="checkpoint.pth.tar",
         bb_settings=None,
-        compression=None
+        compression=None,
+        args=None
 ):
     prec1 = -1
     root = False
@@ -609,23 +610,25 @@ def train_loop(
 
         if issubclass(type(compression), compressors.Quantizer):
             d, sum = compression.get_metrics_magnitudes()
-            if epoch > 0 and epoch % 10 == 0:
-                compression.reset_metrics()
-                d, sum = compression.get_metrics_magnitudes()
-            else:
+            e = epoch + 1
+            if e % args.adapt_compression_adjust_freq == 0:
                 compression.adjust_bits()
+            if e % args.adapt_compression_reset_freq == 0:
+                compression.reset_metrics()
             if d:
                 directory = os.path.join(checkpoint_dir, "adapt_logs".format(compression.bits))
                 os.makedirs(directory, exist_ok=True)
                 file = "epoch{}.json".format(epoch)
                 if root:
-                    with open(os.path.join(directory, file), 'w') as f:
-                        # d = {k: v / sum for k,v in d.items()}
-                        json.dump(d, f)
-                    d = compression.get_compression_scheme()
-                    file = "compress_scheme_{}.json".format(epoch)
-                    with open(os.path.join(directory, file), 'w') as f:
-                        json.dump(d, f)
+                    if e % args.adapt_compression_reset_freq != 0:
+                        with open(os.path.join(directory, file), 'w') as f:
+                            # d = {k: v / sum for k,v in d.items()}
+                            json.dump(d, f)
+                    if e % args.adapt_compression_adjust_freq == 0:
+                        d = compression.get_compression_scheme()
+                        file = "compress_scheme_{}.json".format(epoch)
+                        with open(os.path.join(directory, file), 'w') as f:
+                            json.dump(d, f)
 
         if save_checkpoints and root:
             if not skip_validation:

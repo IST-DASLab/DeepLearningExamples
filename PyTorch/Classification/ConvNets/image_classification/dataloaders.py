@@ -34,10 +34,9 @@ import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 from PIL import Image
 from functools import partial
-import horovod.torch as hvd
 from . import utils
 
-DATA_BACKEND_CHOICES = ["pytorch", "syntetic"]
+DATA_BACKEND_CHOICES = ["pytorch", "synthetic"]
 try:
     from nvidia.dali.plugin.pytorch import DALIClassificationIterator
     from nvidia.dali.pipeline import Pipeline
@@ -51,6 +50,12 @@ except ImportError:
         "Please install DALI from https://www.github.com/NVIDIA/DALI to run this example."
     )
 
+try:
+    import horovod.torch as hvd
+except ImportError:
+    print(
+        "Horovod is not installed"
+    )
 
 def load_jpeg_from_file(path, cuda=True, fp16=False):
     img_transforms = transforms.Compose(
@@ -479,7 +484,7 @@ def get_pytorch_val_loader(
     return PrefetchedWrapper(val_loader, 0, num_classes, fp16, one_hot), len(val_loader)
 
 
-class SynteticDataLoader(object):
+class SyntheticDataLoader(object):
     def __init__(
         self,
         fp16,
@@ -538,7 +543,7 @@ def get_levels_est_loader(
         sampler=train_sampler, **kwargs)
 
 
-def get_syntetic_loader(
+def get_synthetic_loader(
     data_path,
     batch_size,
     num_classes,
@@ -549,4 +554,4 @@ def get_syntetic_loader(
     fp16=False,
     memory_format=torch.contiguous_format,
 ):
-    return SynteticDataLoader(fp16, batch_size, num_classes, 3, 224, 224, one_hot, memory_format=memory_format), -1
+    return SyntheticDataLoader(fp16, batch_size, num_classes, 3, 224, 224, one_hot, memory_format=memory_format), -1

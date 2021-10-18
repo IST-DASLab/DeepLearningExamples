@@ -14,23 +14,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 NUM_NODES=8
-q=5
-bucket_size=1024
+q=4
+bucket_size=128
 
 compression_config_file="--compression-config-filename config_compress.yaml"
 #compression_config_file=""
 BATCH_SIZE=$(( 32 * $NUM_NODES ))
 echo 'Run training...'
-for type in none; do
+for type in SRA; do
 #  workdir="workdir_quan/${type}_${q}_${bucket_size}"
   workdir="workdir_topk/test"
   mkdir -p $workdir
   horovodrun -np $NUM_NODES -q $q --compression-bucket-size ${bucket_size} \
-      --compression-nccl-fake-ratio 1.0 \
-      --reduction-type $type --communicator-type SHM --compression-type maxmin \
-      --fusion-threshold-mb 128 --cache-capacity 2048 --no-hierarchical-allgather --cycle-time-ms 1 --no-hierarchical-allreduce \
-      --compression-mode NonFused --compression-skip-incomplete-buckets $compression_config_file \
-      python train.py \
+        --compression-nccl-fake-ratio 1.0 \
+        --reduction-type $type --communicator-type SHM --compression-type maxmin \
+        --fusion-threshold-mb 128 --cache-capacity 2048 --no-hierarchical-allgather --cycle-time-ms 1 --no-hierarchical-allreduce \
+        --compression-mode NonFused --compression-skip-incomplete-buckets $compression_config_file \
+    python train.py \
       --config_file wt103_base.yaml \
       --config rtx3090_fp16 \
       --hvd \

@@ -32,7 +32,13 @@ import numpy as np
 import torch
 import shutil
 import torch.distributed as dist
-import horovod.torch as hvd
+
+try:
+    import horovod.torch as hvd
+except ImportError:
+    print(
+        "Horovod is not installed"
+    )
 
 hvd_init = None
 
@@ -42,7 +48,7 @@ def horovod_enabled():
         try:
             hvd.size()
             hvd_init = True
-        except ValueError:
+        except (NameError, ValueError):
             hvd_init = False
     return hvd_init
 

@@ -2,6 +2,7 @@
 wt103: &wt103
    dataset: wt103
    data: /nvmedisk/Datasets/wikitext-103/
+#   data: ../data/wikitext-103
 #   data: /home/imarkov/Datasets/transformer_data/wikitext-103/
 
 train: &train
@@ -275,10 +276,11 @@ rtx2080: &rtx2080
 # Training benchmarks
 trainbench_rtx2080: &trainbench_rtx2080
    train:
-      <<: *rtx2080
-      log_interval: 1
-      max_step: 500
-      local_batch_size: 24
+      <<: *train
+      log_interval: 10
+      max_step: 300
+      fp16: true
+      batch_chunk: 4
 
 trainbench: &trainbench
    train:

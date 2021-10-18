@@ -75,8 +75,14 @@ from image_classification.utils import *
 import dllogger
 import sys
 
-sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..')))
-import Common.compressors as compressors
+try:
+    from gcomp_sim import CompressorManager, OTHERS, MaxMinQuantizer, TopKCompressor
+    from gcomp_sim import DistributedOptimizer as gcomp_DistributedOptimizer
+    from gcomp_sim import Adjuster, KMeanAdjuster
+    grad_sim_available=True
+except ModuleNotFoundError:
+    grad_sim_available=False
+    print('Gradient compression simulation is unavailable')
 
 
 def add_parser_arguments(parser):
@@ -325,7 +331,7 @@ def add_parser_arguments(parser):
     parser.add_argument(
         "--bb-num-parallel-steps", default=10, type=int, help="Number of parallel steps"
     )
-    parser.add_argument("--compression-type", type=str, default="none", choices=compressors.compression_types,
+    parser.add_argument("--compression-type", type=str, default="none", choices=["maxmin", "none"],
                         help="Compression Type (default: none)")
     parser.add_argument("--quantization-bits", type=int, default=4,
                         help="Quantization bits (default: 4)")
@@ -349,10 +355,15 @@ def add_parser_arguments(parser):
                         help="local rank")
     parser.add_argument('--powersgd-rank', type=int, default=None,
                         help='Rank of powersgd compression to run DDP with')
+    parser.add_argument('--adapt-compression', action='store_true', default=False,
+                        help='Perform adaptive compression.')
     parser.add_argument('--adapt-compression-adjust-freq', type=int, default=1,
                         help='Adaptive compression. Frequency in epochs to perform bits adjustment.')
     parser.add_argument('--adapt-compression-reset-freq', type=int, default=10,
                         help='Adaptive compression. Frequency in epochs to reset stats.')
+    parser.add_argument('--backend', choices=['qmpi', 'nccl', 'gloo'], default='nccl',
+                        help='Backend for torch distributed.')
+
 
 
 def count_parameters(model):
@@ -371,6 +382,21 @@ def main(args):
     elif "WORLD_SIZE" in os.environ:
         args.distributed = int(os.environ["WORLD_SIZE"]) > 1
         args.local_rank = int(os.environ["LOCAL_RANK"])
+    elif "OMPI_COMM_WORLD_SIZE" in os.environ:
+        args.local_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '4040'
+        os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]
+        os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
+        args.distributed = int(os.environ["WORLD_SIZE"]) > 1
+    if args.backend == 'qmpi':
+        import torch_qmpi
+        assert "OMPI_COMM_WORLD_SIZE" in os.environ
+        if 'COMPRESSION_QUANTIZATION_BITS' not in os.environ:
+            os.environ['COMPRESSION_QUANTIZATION_BITS'] = str(args.quantization_bits)
+        if 'COMPRESSION_BUCKET_SIZE' not in os.environ:
+            os.environ['COMPRESSION_BUCKET_SIZE'] = str(args.quantization_bucket_size)
+
 
     args.gpu = 0
     args.world_size = 1
@@ -382,8 +408,9 @@ def main(args):
     if args.distributed:
         args.gpu = args.local_rank % torch.cuda.device_count()
         torch.cuda.set_device(args.gpu)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend=args.backend, init_method="env://")
         args.world_size = torch.distributed.get_world_size()
+        torch.distributed.barrier()
 
     if args.amp and args.fp16:
         print("Please use only one of the --fp16/--amp flags")
@@ -493,9 +520,9 @@ def main(args):
     elif args.data_backend == "dali-cpu":
         get_train_loader = get_dali_train_loader(dali_cpu=True)
         get_val_loader = get_dali_val_loader()
-    elif args.data_backend == "syntetic":
-        get_val_loader = get_syntetic_loader
-        get_train_loader = get_syntetic_loader
+    elif args.data_backend == "synthetic":
+        get_val_loader = get_synthetic_loader
+        get_train_loader = get_synthetic_loader
 
     train_loader, train_loader_len = get_train_loader(
         args.data,
@@ -571,22 +598,13 @@ def main(args):
     bb_settings = None
     compression = None
     if args.hvd:
-        if args.dgc:
-            optimizer = compressors.DGCompressor(model_and_loss.model.parameters(), args.lr,
-                                                 args.momentum,
-                                                 args.weight_decay,
-                                                 nesterov=args.nesterov,
-                                                 k_ratio=args.topk_ratio, warmup_steps=args.compressor_warmup_steps,
-                                                 clip=0.25
-                                                 )
-        else:
-            compression = compressors.get_compressor(args, model_and_loss.model.named_parameters())
-            if args.big_grad:
-                optimizer = compressors.CompressedSGDBig(optimizer, compression)
-            else:
-                optimizer = hvd.DistributedOptimizer(optimizer,
-                                                     named_parameters=model_and_loss.model.named_parameters(),
-                                                     op=hvd.Average, compression=compression)
+        quantizer = MaxMinQuantizer(args.quantization_bits, args.bucket_size, enable_error_correction=True, named_parameters=model_and_loss.model.named_parameters())
+        adjuster = KMeanAdjuster(quantizer)
+        quantizer.add_adjuster(adjuster)
+        compression = CompressorManager({OTHERS: quantizer}, model_and_loss.model.named_parameters())
+        optimizer = gcomp_DistributedOptimizer(optimizer,
+                                             named_parameters=model_and_loss.model.named_parameters(),
+                                             op=hvd.Average, compression=compression)
 
     if args.amp:
         model_and_loss, optimizer = amp.initialize(
@@ -605,6 +623,12 @@ def main(args):
     if args.hvd and hvd.size() > 1:
         hvd.broadcast_parameters(model_and_loss.model.state_dict(), root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+    if args.backend == 'qmpi':
+        layers = [(name, p.numel()) for name, p in model_and_loss.model.named_parameters()]
+        torch_qmpi.register_model(layers)
+        torch_qmpi.exclude_layer("bn")
+        torch_qmpi.exclude_layer("bias")
+
     train_loop(
         model_and_loss,
         optimizer,

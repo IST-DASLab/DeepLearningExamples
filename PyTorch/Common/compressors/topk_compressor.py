@@ -149,6 +149,9 @@ class TopKCompressor(Compressor):
         grad = p.grad.data
         if self.warm_up > step:
             return grad, None
+        if p.grad.data.dtype == torch.float16:
+            grad = grad.float()
+
         if p not in self.state:
             self.state[p] = {}
             if self.enable_error_correction:
@@ -168,6 +171,8 @@ class TopKCompressor(Compressor):
         if self.enable_error_correction:
             e_c = state["error_correction"]
             e_c.sub_(grad)
+        if p.grad.data.dtype == torch.float16:
+            p.grad.data.copy_(grad.half())
         return p.grad, None
 
     def _topk(self, grad):

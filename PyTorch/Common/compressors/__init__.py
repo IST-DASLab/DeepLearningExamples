@@ -4,7 +4,12 @@ from .CompressedSGDFull import CompressedSGDBig
 compression_types = ["none", "sanity", "maxmin", "exponential", "1bit", "norm_uniform", "terngrad", "topk", "topk_rmsprop", "svd", "stats", "quantile", "3LC"]
 
 import os
-import horovod.torch as hvd
+try:
+    import horovod.torch as hvd
+except ImportError:
+    print(
+        "Horovod is not installed"
+    )
 
 def get_compressor(args, named_parameters):
     if args.compression_type == 'none':
@@ -18,11 +23,11 @@ def get_compressor(args, named_parameters):
             ef_q = None
             error_feedback = args.error_feedback
         if args.compression_type == "maxmin":
-            return MaxMinQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback, named_parameters)
+            return MaxMinQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback, named_parameters, args.adapt_compression)
         elif args.compression_type == "exponential":
-            return ExponentialQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback, named_parameters)
+            return ExponentialQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback, named_parameters, args.adapt_compression)
         elif args.compression_type == "norm_uniform":
-            return NormUniformQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback)
+            return NormUniformQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback, named_parameters, args.adapt_compression)
         if args.compression_type == "terngrad":
             return TernGrad(args.bucket_size, args.error_feedback, named_parameters)
         elif args.compression_type == "sanity":

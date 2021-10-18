@@ -1,7 +1,12 @@
 import torch
 from torch.optim import Optimizer
-from horovod.torch import allreduce_, Average
 from contextlib import contextmanager
+try:
+    import horovod.torch as hvd
+except ImportError:
+    print(
+        "Horovod is not installed"
+    )
 
 
 class _CompressedSGDBig(Optimizer):

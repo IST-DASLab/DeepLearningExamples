@@ -1,17 +1,35 @@
 import torch
 from .compressor import Compressor
-import horovod.torch as hvd
-from .adjuster import LinearAdjuster, BayesianAdjuster
+from .adjuster import LinearAdjuster, BayesianAdjuster, BestPerLayer, KMeanAdjuster
+
+from .pyhessian import hessian
+import copy
+from apex import amp
+
+try:
+    import horovod.torch as hvd
+except ImportError:
+    print(
+        "Horovod is not installed"
+    )
 
 class Quantizer(Compressor):
     def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None, adaptive=False):
         super().__init__()
         self.bits = bits
-        self.bits_min = 1
-        self.bits_max = 8
+        self.bits_min = 2
+        self.bits_max = 4
         self.bits_default = bits
         self.num_levels = 1 << bits
         self.bucket_size = bucket_size
+        self.bucket_size_default = bucket_size
+        self.buckets_bits_mapping = {
+            1: 32,
+            2: 128,
+            3: min(256, self.bucket_size_default),
+            4: self.bucket_size_default
+        }
+
         self.states = {}
         self.save_error_correction = enable_error_correction
         if adaptive:
@@ -21,12 +39,14 @@ class Quantizer(Compressor):
         self.momentum_acc = 0.8
         self.excluded_layer_names = ["layer_norm", "bias", "bn"]
         self.is_adaptive = adaptive
-        self.adjuster = BayesianAdjuster(self)
+        self.adjuster = KMeanAdjuster(self)
+        # self.adjuster = LinearAdjuster(self)
+        # self.adjuster = BayesianAdjuster(self)
+        # self.adjuster = BestPerLayer(self)
         if named_parameters:
             named_parameters = list(named_parameters)
             self.named_parameters = {p: name for name, p in named_parameters if p.requires_grad}
             self.parameters_sizes = {name: p.numel() for name, p in named_parameters if p.requires_grad}
-            self.parameters_qbits = {}
             for name, p in named_parameters:
                 if not p.requires_grad:
                     continue
@@ -38,7 +58,11 @@ class Quantizer(Compressor):
                 if skip_layer:
                     continue
                 self.states[p] = {}
-                self.states[p]["bits"] = self.bits
+                self.states[p]["bits"] = self.bits_default
+                self.states[p]["name"] = self.named_parameters[p]
+                if self.named_parameters[p] == "word_emb.emb_layers.0.weight":
+                    self.states[p]["bits"] = 3
+
         # self.exact_match = {name: False for name in named_parameters}
             # for i in range(len(named_parameters)):
             #     for j in range(i + 1, len(named_parameters)):
@@ -56,7 +80,7 @@ class Quantizer(Compressor):
         for p, state in self.states.items():
             if "momentum" in state:
                 state["momentum"].fill_(0.0)
-            state["bits"] = self.bits_default
+            # state["bits"] = self.bits_default
 
     def update_metric_stats(self, parameters):
         if not self.is_adaptive:
@@ -70,18 +94,30 @@ class Quantizer(Compressor):
                 d_p = d_p.float()
             if "momentum" not in state:
                 state["momentum"] = torch.zeros_like(d_p)
-            state["momentum"].add_(d_p)
+            state["momentum"].add_(d_p, alpha=self.momentum_acc)
 
     def get_metric(self, p, compute=True):
         state = self.states[p]
-        if compute:
-            buf = state["momentum"]
-            self.set_num_levels(p)
-            if torch.isinf(buf).sum() > 0:
-                state["compression_error"] = float("inf")
-            else:
-                state["compression_error"] = (buf - self._compress(buf, inplace=False)).norm(p=2).item()
-        return state["compression_error"]
+        buf = state["momentum"]
+        # return torch.norm(buf, p=2).item()
+        estimate_num = 100
+        values, _ = buf.abs().view(-1).topk(min(estimate_num, buf.numel()))
+        return torch.norm(values, p=2).item()
+
+    # def get_metric(self, p, compute=True):
+    #     state = self.states[p]
+    #     return state["hess_eigen_value"]
+
+    # def get_metric(self, p, compute=True):
+    #     state = self.states[p]
+    #     if compute:
+    #         buf = state["momentum"]
+    #         self.set_num_levels(p)
+    #         if torch.isinf(buf).sum() > 0:
+    #             state["compression_error"] = float("inf")
+    #         else:
+    #             state["compression_error"] = (buf - self._compress(buf, inplace=False)).norm(p=2).item()
+    #     return state["compression_error"]
         # return state["momentum"].norm(p=2).item()
         # return state["error_correction"].norm(p=2).item()
 
@@ -121,6 +157,16 @@ class Quantizer(Compressor):
                 d[bits] = [name]
         return d
 
+    def compute_eigen_values(self, model, criterion, dataloader):
+        model_copy = copy.deepcopy(model)
+        h = hessian(model_copy, criterion, dataloader=dataloader)
+        eigenvalues, _ = h.eigenvalues()
+        eigenvalues = eigenvalues[0]
+        for i, p in enumerate(model.parameters()):
+            if p not in self.states:
+                continue
+            self.states[p]["hess_eigen_value"] = eigenvalues[i]
+
     def set_bits_states(self, bits):
         assert len(bits) == len(self.states)
         for bit, (p, state) in zip(bits, self.states.items()):
@@ -129,6 +175,11 @@ class Quantizer(Compressor):
     def set_num_levels(self, p):
         bits = self.states[p]["bits"]
         self.num_levels = 1 << bits
+        if bits in self.buckets_bits_mapping:
+            self.bucket_size = self.buckets_bits_mapping[bits]
+        else:
+            self.bucket_size = self.bucket_size_default
+        # self.bucket_size = self.bucket_size_default // (1 << (self.bits_max - bits))
 
     def quantize_bucket(self, a):
         raise NotImplementedError
@@ -146,7 +197,8 @@ class Quantizer(Compressor):
         d_p = p.grad.data
         if p.grad.data.dtype == torch.float16:
             self.adjuster.set_original_bits(16)
-            d_p = d_p.float()
+            loss_scale = amp.state_dict()["loss_scaler0"]['loss_scale']
+            d_p = d_p.float().div_(loss_scale)
 
         state = self.states[p]
         if self.save_error_correction:
@@ -166,7 +218,7 @@ class Quantizer(Compressor):
             e_c.sub_(d_p)
             # grad_copy.sub_(d_p)
         if p.grad.data.dtype == torch.float16:
-            p.grad.data.copy_(d_p.half())
+            p.grad.data.copy_(d_p.mul_(loss_scale).half())
         return p.grad, None
 
     def _compress(self, tensor, inplace=True):
@@ -250,8 +302,8 @@ class Quantizer(Compressor):
 
 
 class MaxMinQuantizer(Quantizer):
-    def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None):
-        super().__init__(bits, bucket_size, enable_error_correction, named_parameters, True)
+    def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None, adapt_compression=False):
+        super().__init__(bits, bucket_size, enable_error_correction, named_parameters, adapt_compression)
 
     def quantize_bucket(self, a):
         if self.num_levels == 1 << 32 or torch.isinf(a).sum() > 0:
@@ -280,10 +332,11 @@ class MaxMinQuantizer(Quantizer):
 
 
 class ExponentialQuantizer(Quantizer):
-    def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None):
-        super().__init__(bits, bucket_size, enable_error_correction, named_parameters)
+    def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None, adapt_compression=False):
+        super().__init__(bits, bucket_size, enable_error_correction, named_parameters, adapt_compression)
         self.num_levels = self.num_levels // 2
-        self.norm_type = float("inf")
+        # self.norm_type = float("inf")
+        self.norm_type = 2
         self.levels_1dim = torch.tensor([0.5 ** i for i in range(self.num_levels, 0, -1)])
         self.levels_2dim = self.levels_1dim[:, None]
 
@@ -304,6 +357,10 @@ class ExponentialQuantizer(Quantizer):
             self.levels_1dim = self.levels_1dim.to(buf.device)
             res = self.quantize_1_dim_with_levels(a, self.levels_1dim)
         return res * sign * vnorm
+
+    def set_num_levels(self, p):
+        bits = self.states[p]["bits"]
+        self.num_levels = (1 << bits) // 2
 
     def quantize_bucket(self, a):
         if a.dim() == 2:
@@ -335,12 +392,16 @@ class ExponentialQuantizer(Quantizer):
 
 
 class NormUniformQuantizer(Quantizer):
-    def __init__(self, bits, bucket_size, enable_error_correction=False):
-        super().__init__(bits, bucket_size, enable_error_correction)
+    def __init__(self, bits, bucket_size, enable_error_correction=False, named_parameters=None, adapt_compression=False):
+        super().__init__(bits, bucket_size, enable_error_correction, named_parameters, adapt_compression)
         self.num_levels = self.num_levels // 2
         self.levels_1dim = torch.tensor([i * 1.0 / (self.num_levels + 1) for i in range(1, self.num_levels + 1)])
         self.levels_2dim = self.levels_1dim[:, None]
         self.norm_type = float("inf")
+
+    def set_num_levels(self, p):
+        bits = self.states[p]["bits"]
+        self.num_levels = (1 << bits) // 2
 
     def quantize_bucket_new(self, buf):
         sign = buf.sign()
@@ -371,8 +432,7 @@ class NormUniformQuantizer(Quantizer):
         vnorm = torch.max(vnorm, s)
         sign = torch.sign(a)
         # cast sign to 1 bit
-        sign.add_(1).div_(2)
-        sign.mul_(2).add_(-1)
+        sign[sign == 0.0] = 1.0
         if self.num_levels > 1:
             q = torch.abs(a / vnorm)
             r = torch.rand(a.shape, device=a.device)

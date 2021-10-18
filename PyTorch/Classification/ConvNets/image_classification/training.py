@@ -47,9 +47,13 @@ except ImportError:
 import json
 
 import sys
+try:
+    from gcomp_sim import Compressor, CompressorManager
+    grad_sim_available=True
+except ImportError:
+    grad_sim_available=False
+    pass
 
-sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..')))
-import Common.compressors as compressors
 
 try:
     # from apex.parallel import DistributedDataParallel as DDP
@@ -291,8 +295,6 @@ def get_train_step(
                     optimizer.step()
             else:
                 optimizer.step()
-            if issubclass(type(compression), compressors.Quantizer):
-                compression.update_metric_stats(model_and_loss.model.parameters())
             optimizer.zero_grad()
 
         torch.cuda.synchronize()
@@ -569,12 +571,6 @@ def train_loop(
 
     print(f"RUNNING EPOCHS FROM {start_epoch} TO {end_epoch}")
     for epoch in range(start_epoch, end_epoch):
-        # if bb_settings is not None:
-        #     assert hvd_enabled
-        #     optimizer = hvd.BrokenBarrier(model_and_loss.model, orig_optimizer, named_parameters=model_and_loss.model.named_parameters(), **bb_settings)
-        #     hvd.broadcast_parameters(model_and_loss.model.state_dict(), root_rank=0)
-        #     hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-
         if logger is not None:
             logger.start_epoch()
         end = time.time()
@@ -608,27 +604,42 @@ def train_loop(
         if logger is not None:
             logger.end_epoch()
 
-        if issubclass(type(compression), compressors.Quantizer):
-            d, sum = compression.get_metrics_magnitudes()
+        # if issubclass(type(compression), Compressor):
+        #     start_adjust = time.time()
+        #     num_samples = 5
+        #     data_iter = enumerate(train_loader)
+        #     data_iter = list(utils.first_n(num_samples, data_iter))
+        #     if root:
+        #         compression.compute_eigen_values(model_and_loss.model, model_and_loss.loss, data_iter)
+
+        # if epoch >= args.warmup and issubclass(type(compression), Compressor):
+        if grad_sim_available and (issubclass(type(compression), Compressor) or isinstance(compression, CompressorManager)):
+            start_adjust = time.time()
             e = epoch + 1
-            if e % args.adapt_compression_adjust_freq == 0:
-                compression.adjust_bits()
-            if e % args.adapt_compression_reset_freq == 0:
-                compression.reset_metrics()
-            if d:
-                directory = os.path.join(checkpoint_dir, "adapt_logs".format(compression.bits))
-                os.makedirs(directory, exist_ok=True)
-                file = "epoch{}.json".format(epoch)
+            if e % args.adapt_compression_adjust_freq == 0 and epoch >= args.warmup:
+                compression.adjust_params()
                 if root:
-                    if e % args.adapt_compression_reset_freq != 0:
-                        with open(os.path.join(directory, file), 'w') as f:
-                            # d = {k: v / sum for k,v in d.items()}
-                            json.dump(d, f)
-                    if e % args.adapt_compression_adjust_freq == 0:
-                        d = compression.get_compression_scheme()
+                    print("Time for adjusting: ", time.time() - start_adjust)
+            if root:
+                d = compression.get_all_metrics()["MaxMinQuantizer"]
+                if d:
+                    total = np.linalg.norm(np.array(list(d.values())), ord=2)
+                    print("Total norm: ", total)
+                    d["total"] = total
+                    directory = os.path.join(checkpoint_dir, "adapt_logs".format(compression.bits))
+                    os.makedirs(directory, exist_ok=True)
+                    file = "epoch{}.json".format(epoch)
+                    with open(os.path.join(directory, file), 'w') as f:
+                        # d = {k: v / sum for k,v in d.items()}
+                        print(d)
+                        json.dump(d, f)
+                    if compression.is_adaptive and e % args.adapt_compression_adjust_freq == 0 and epoch >= args.warmup:
+                        d = compression.get_compression_scheme()["MaxMinQuantizer"]
+                        print(d)
                         file = "compress_scheme_{}.json".format(epoch)
                         with open(os.path.join(directory, file), 'w') as f:
                             json.dump(d, f)
+            compression.reset_metrics()
 
         if save_checkpoints and root:
             if not skip_validation:

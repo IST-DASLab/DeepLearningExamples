@@ -1,6 +1,12 @@
 import numpy as np
-import horovod.torch as hvd
 import pickle
+
+try:
+    import horovod.torch as hvd
+except ImportError:
+    print(
+        "Horovod is not installed"
+    )
 
 try:
     from horovod.torch.compression import Compressor as hvd_Compressor

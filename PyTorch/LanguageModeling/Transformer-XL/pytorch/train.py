@@ -49,6 +49,7 @@ import warnings
 
 try:
     import horovod.torch as hvd
+    # import byteps.torch as hvd
 except ImportError:
     warnings.warn('Horovod is unavailable')
 
@@ -57,8 +58,23 @@ try:
 except ModuleNotFoundError:
     warnings.warn('APEX AMP is unavailable')
 
-sys.path.append(os.path.abspath(os.path.join(sys.path[0], '..', '..', '..')))
-import Common.compressors as compressors
+try:
+    from fairscale.nn import FullyShardedDataParallel
+    from fairscale.optim.oss import OSS
+    from fairscale.nn.wrap import auto_wrap, enable_wrap, default_auto_wrap_policy
+except ModuleNotFoundError:
+    warnings.warn('Fairscale is unavailable')
+
+from functools import partial
+
+try:
+    from gcomp_sim import CompressorManager, OTHERS, MaxMinQuantizer, TopKCompressor
+    from gcomp_sim import DistributedOptimizer as gcomp_DistributedOptimizer
+    grad_sim_available=True
+except ModuleNotFoundError:
+    grad_sim_available=False
+    warnings.warn('Gradient compression simulation is unavailable')
+
 import json
 
 
@@ -122,12 +138,12 @@ def parse_args():
     general.add_argument('--amp', choices=['apex', 'pytorch'], default='apex',
                          help='Implementation of automatic mixed precision')
     general.add_argument('--affinity', type=str,
-                     default='socket_unique_interleaved',
-                     choices=['socket', 'single', 'single_unique',
-                              'socket_unique_interleaved',
-                              'socket_unique_continuous',
-                              'disabled'],
-                     help='type of CPU affinity')
+                         default='socket_unique_interleaved',
+                         choices=['socket', 'single', 'single_unique',
+                                  'socket_unique_interleaved',
+                                  'socket_unique_continuous',
+                                  'disabled'],
+                         help='type of CPU affinity')
 
     dataset = parser.add_argument_group('dataset setup')
     dataset.add_argument('--data', type=str, default='../data/wikitext-103',
@@ -263,7 +279,7 @@ def parse_args():
                         help='Run using horovod')
     parser.add_argument('--powersgd-rank', type=int, default=None,
                         help='Rank of powersgd compression to run DDP with')
-    parser.add_argument("--compression-type", type=str, default="none", choices=compressors.compression_types,
+    parser.add_argument("--compression-type", type=str, default="none", choices=["maxmin", "topk"],
                         help="Compression Type (default: none)")
     parser.add_argument("--quantization-bits", type=int, default=4,
                         help="Quantization bits (default: 4)")
@@ -282,10 +298,18 @@ def parse_args():
     # parser.add_argument('--powersgd-reducer', type=str, choices=powersgd.supported_reducers, default='none',
     #                     help="Reducer from powersgd repo")
     parser.add_argument('--optimizer-reducer-rank', type=int, default=4, help="Powersgd rank")
+    parser.add_argument('--adapt-compression', action='store_true', default=False,
+                        help='Perform adaptive compression.')
+    parser.add_argument('--adapt-compression-adjust-freq', type=int, default=1,
+                        help='Adaptive compression. Frequency in epochs to perform bits adjustment.')
+    parser.add_argument('--adapt-compression-reset-freq', type=int, default=10,
+                        help='Adaptive compression. Frequency in epochs to reset stats.')
+    parser.add_argument('--backend', choices=['qmpi', 'nccl', 'gloo'], default='nccl',
+                        help='Backend for torch distributed.')
+    parser.add_argument('--fairscale', action='store_true', default=False, help="Use fairscale")
 
     parser.set_defaults(**config)
     args, _ = parser.parse_known_args()
-
     args.tied = not args.not_tied
 
     if args.d_embed < 0:
@@ -293,7 +317,7 @@ def parse_args():
 
     assert args.ext_len >= 0, 'extended context length must be non-negative'
     assert args.batch_size % args.batch_chunk == 0
-
+    assert not (args.hvd and args.fairscale)
     return args
 
 
@@ -471,7 +495,7 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
           timeout_handler, args, compression):
     # Turn on training mode which enables dropout.
     model.train()
-    is_quantization_compression = issubclass(type(compression), compressors.Quantizer)
+    is_adaptive_compression = grad_sim_available and compression is not None and compression.is_adaptive
     train_loss = 0
     target_tokens = 0
     log_step = 0
@@ -545,9 +569,10 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
             optimizer_sparse.step()
 
         # update synchronized gradients stats
-        if is_quantization_compression:
+        if is_adaptive_compression:
             compression.update_metric_stats(model.parameters())
-
+        # if args.local_rank == 0:
+        #     print("End step")
         # step-wise learning rate annealing
         train_step += 1
         if args.scheduler in ['cosine', 'constant', 'dev_perf']:
@@ -619,22 +644,27 @@ def train(tr_iter, va_iter, model, para_model, model_config, optimizer,
         do_periodic_eval = train_step % args.eval_interval == 0
         is_final_step = train_step == args.max_step
         interrupted = timeout_handler.interrupted
-        if train_step > 0 and train_step % args.eval_interval == 0 and is_quantization_compression:
-            d, sum = compression.get_metrics_magnitudes()
-            if train_step % 10000 == 0:
-                compression.reset_metrics()
-                # d, sum = compression.get_metrics_magnitudes()
-            else:
+        if grad_sim_available and (issubclass(type(compression), Compressor) or isinstance(compression, CompressorManager)):
+            d = compression.get_all_metrics()["MaxMinQuantizer"]
+
+            if train_step > args.warmup_step and compression.is_adaptive:
+                start_adjust = time.time()
                 compression.adjust_bits()
+                if args.local_rank == 0:
+                    print("Time for adjusting: ", time.time() - start_adjust)
+            if train_step % args.adapt_compression_reset_freq == 0:
+                compression.reset_metrics()
             if d:
                 if args.local_rank == 0:
+                    print(d)
                     directory = os.path.join(args.work_dir, "adapt-logs")
                     os.makedirs(directory, exist_ok=True)
                     file = "step_{}.json".format(train_step)
                     with open(os.path.join(directory, file), 'w') as f:
                         # d = {k: v / sum for k,v in d.items()}
                         json.dump(d, f)
-                    d = compression.get_compression_scheme()
+                    d = compression.get_compression_scheme()["MaxMinQuantizer"]
+                    print(d)
                     file = "compress_scheme_{}.json".format(train_step)
                     with open(os.path.join(directory, file), 'w') as f:
                         json.dump(d, f)
@@ -706,6 +736,13 @@ def main():
     if args.hvd:
         utils.distributed.init_hvd()
         args.local_rank = hvd.local_rank()
+    if "OMPI_COMM_WORLD_SIZE" in os.environ:
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '4040'
+        os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]
+        os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
+        args.local_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+
     if args.affinity != 'disabled':
         nproc_per_node = torch.cuda.device_count()
         affinity = utils.gpu_affinity.set_affinity(
@@ -718,7 +755,15 @@ def main():
     torch.cuda.set_device(args.local_rank)
     l2_promote()
     device = torch.device('cuda' if args.cuda else 'cpu')
-    utils.distributed.init_distributed(args.cuda)
+    if not args.hvd:
+        utils.distributed.init_distributed(args.cuda, args.backend)
+        if args.backend == 'qmpi':
+            import torch_qmpi
+        # assert "OMPI_COMM_WORLD_SIZE" in os.environ
+        if 'COMPRESSION_QUANTIZATION_BITS' not in os.environ:
+            os.environ['COMPRESSION_QUANTIZATION_BITS'] = str(args.quantization_bits)
+        if 'COMPRESSION_BUCKET_SIZE' not in os.environ:
+            os.environ['COMPRESSION_BUCKET_SIZE'] = str(args.bucket_size)
 
     args.work_dir = utils.exp_utils.build_work_dir_name(args.work_dir,
                                                         args.dataset,
@@ -879,19 +924,29 @@ def main():
         optimizer = lamb.JITLamb(model.parameters(), lr=args.lr,
                                  weight_decay=args.weight_decay)
         optimizer_sparse = None
+    if args.backend == 'qmpi':
+        layers = [(name, p.numel()) for name, p in model.named_parameters()]
+        torch_qmpi.register_model(layers)
+        # torch_qmpi.exclude_layer('word_emb.emb_layers.0.weight')
+        torch_qmpi.exclude_layer('layer_norm')
+        torch_qmpi.exclude_layer('bias')
+
+
     model = model.to(device)
     compression = None
     if args.hvd and args.multi_gpu == 'ddp':
-        # compression = hvd.Compression.none
-        compression = compressors.get_compressor(args, model.named_parameters())
-        # compression = hvd.Compression.fp32
-        if not args.big_grad:
-            optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), op=hvd.Average,
-                                                 compression=compression, backward_passes_per_step=args.batch_chunk)
-            # optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), op=hvd.Average,
-            #                                      compression=compression)
+        if grad_sim_available:
+            named_parameters = model.named_parameters()
+            compressors = {}
+            compressors['word_emb.emb_layers.0.weight'] = TopKCompressor(0.01, True)
+            compressors[OTHERS] = MaxMinQuantizer(args.quantization_bits, args.bucket_size, args.error_feedback)
+            compression = CompressorManager(compressors, named_parameters=named_parameters,
+                                            excluded_layer_names=["layer_norm", "bias", "bn"])
+            optimizer = gcomp_DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), op=hvd.Average,
+                                                 compression=compression)
         else:
-            optimizer = CompressedSGDBig(optimizer, compression)
+            optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), op=hvd.Average,
+                                                 compression=compression)
         hvd.broadcast_parameters(model.state_dict(), root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
@@ -907,18 +962,24 @@ def main():
             )
 
     if args.multi_gpu == 'ddp' and torch.distributed.is_initialized():
-        para_model = DistributedDataParallel(model,
+        if args.fairscale:
+            with enable_wrap(wrapper_cls=FullyShardedDataParallel, mixed_precision=True, flatten_parameters=True):
+                    para_model = auto_wrap(model,
+                                           auto_wrap_policy=functools.partial(default_auto_wrap_policy, min_num_params=1e7))
+        else:
+            para_model = DistributedDataParallel(model,
                                              device_ids=[args.local_rank],
                                              output_device=args.local_rank,
                                              broadcast_buffers=False,
                                              find_unused_parameters=True,
+                                             bucket_cap_mb=25,
                                              )
-        if args.powersgd_rank:
-            state = powerSGD.PowerSGDState(torch.distributed.group.WORLD,
-                                           matrix_approximation_rank=args.powersgd_rank, warm_start=True,
-                                           start_powerSGD_iter=10,
-                                           use_error_feedback=True)
-            para_model.register_comm_hook(state, powerSGD.powerSGD_hook)
+            if args.powersgd_rank:
+                state = powerSGD.PowerSGDState(torch.distributed.group.WORLD,
+                                               matrix_approximation_rank=args.powersgd_rank, warm_start=True,
+                                               start_powerSGD_iter=10,
+                                               use_error_feedback=True)
+                para_model.register_comm_hook(state, powerSGD.powerSGD_hook)
 
     elif args.multi_gpu == 'dp':
         if args.gpu0_bsz >= 0:

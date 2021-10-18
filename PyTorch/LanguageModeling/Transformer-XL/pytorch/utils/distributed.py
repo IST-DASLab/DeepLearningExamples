@@ -14,7 +14,10 @@
 
 import os
 from contextlib import contextmanager
-import horovod.torch as hvd
+try:
+    import horovod.torch as hvd
+except ModuleNotFoundError:
+    pass
 import torch
 
 hvd_initialized = False
@@ -25,7 +28,7 @@ def init_hvd():
     hvd_initialized = True
 
 
-def init_distributed(cuda):
+def init_distributed(cuda, backend='nccl'):
     """
     Initializes distributed backend.
 
@@ -34,8 +37,10 @@ def init_distributed(cuda):
     """
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     distributed = (world_size > 1)
+    if backend == 'qmpi':
+       import torch_qmpi
     if distributed:
-        backend = 'nccl' if cuda else 'gloo'
+        # backend = 'nccl' if cuda else 'gloo'
         torch.distributed.init_process_group(backend=backend,
                                              init_method='env://')
         assert torch.distributed.is_initialized()
@@ -50,6 +55,7 @@ def barrier():
         torch.distributed.barrier()
     elif hvd_initialized:
         hvd.allreduce(torch.tensor([0.0]), name="Barrier")
+        # hvd.push_pull(torch.tensor([0.0]), name="Barrier")
 
 
 def get_rank():
@@ -89,6 +95,7 @@ def all_reduce_item(value, op='sum'):
             if op == 'sum' or op == 'mean':
                 hop = hvd.Sum if op == 'sum' else hvd.Average
                 tensor = hvd.allreduce(tensor, op=hop)
+                # tensor = hvd.push_pull(tensor, op=hop)
             elif op == 'min' or op == 'max' or op == 'product':
                 tensor = hvd.allgather(tensor)
                 if op == 'min':
@@ -113,7 +120,7 @@ def all_reduce_item(value, op='sum'):
                 raise RuntimeError('Unsupported reduce op')
 
             backend = torch.distributed.get_backend()
-            if backend == torch.distributed.Backend.NCCL:
+            if backend == torch.distributed.Backend.NCCL or backend == 'qmpi':
                 device = torch.device('cuda')
             elif backend == torch.distributed.Backend.GLOO:
                 device = torch.device('cpu')

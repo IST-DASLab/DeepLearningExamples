@@ -1,37 +1,20 @@
 NUM_NODES=8
 raport_file="raport.json"
 dataset_path=/nvmedisk/Datasets/ILSVRC/Data/CLS-LOC/
-#dataset_path=/nfs/scistore14/alistgrp/imarkov/Datasets/imagewoof
+#dataset_path=/home/imarkov/Datasets/imagewoof
 BATCH_SIZE=256
 #BATCH_SIZE=32
 rm -rf ~/.horovod
 lr=`echo "print($BATCH_SIZE * $NUM_NODES * 0.001)" | python`
 
-q=4
-workspace="./workspace_quan/imagenet_rn18/maxmin-${q}-1"
+q=3
+bucket_size=1024
+workspace="./workspace_stats/imagenet_rn18/adaptive_2_4_reset"
+#workspace="./workspace_stats/imagenet_rn50/kmeans_1_4_magnitude_based_adaptive_bucket_size_${bucket_size}_2_no_sizes"
 mkdir -p $workspace
 horovodrun -np $NUM_NODES --disable-cache \
 python ./main.py $dataset_path --data-backend dali-cpu --raport-file raport.json -j8 -p 100 --lr $lr \
 --optimizer-batch-size $(( BATCH_SIZE * NUM_NODES )) --warmup 8 --arch resnet18 -c fanin --label-smoothing 0.1 \
 --lr-schedule cosine --mom 0.875 --wd 3.0517578125e-05 --workspace $workspace -b $BATCH_SIZE --amp \
---static-loss-scale 128 --epochs 90 --hvd --bucket-size 128 --no-checkpoints --tensorboard-dir "$workspace/tb_logs" --quantization-bits $q \
---compression-type maxmin
-
-workspace="./workspace_quan/imagenet_rn18/terngrad"
-mkdir -p $workspace
-horovodrun -np $NUM_NODES --disable-cache \
-python ./main.py $dataset_path --data-backend dali-cpu --raport-file raport.json -j8 -p 100 --lr $lr \
---optimizer-batch-size $(( BATCH_SIZE * NUM_NODES )) --warmup 8 --arch resnet18 -c fanin --label-smoothing 0.1 \
---lr-schedule cosine --mom 0.875 --wd 3.0517578125e-05 --workspace $workspace -b $BATCH_SIZE --amp \
---static-loss-scale 128 --epochs 90 --hvd --bucket-size -1 --no-checkpoints --tensorboard-dir "$workspace/tb_logs"  \
---compression-type terngrad
-
-q=4
-workspace="./workspace_quan/imagenet_rn18/exponential-${q}"
-mkdir -p $workspace
-horovodrun -np $NUM_NODES --disable-cache \
-python ./main.py $dataset_path --data-backend dali-cpu --raport-file raport.json -j8 -p 100 --lr $lr \
---optimizer-batch-size $(( BATCH_SIZE * NUM_NODES )) --warmup 8 --arch resnet18 -c fanin --label-smoothing 0.1 \
---lr-schedule cosine --mom 0.875 --wd 3.0517578125e-05 --workspace $workspace -b $BATCH_SIZE --amp \
---static-loss-scale 128 --epochs 90 --hvd --bucket-size 128 --no-checkpoints --tensorboard-dir "$workspace/tb_logs" --quantization-bits $q \
---compression-type exponential
+--static-loss-scale 128 --epochs 20 --resume ./workspace_stats/imagenet_rn18/adaptive_1_4/checkpoint.pth.tar --hvd --bucket-size $bucket_size --tensorboard-dir "$workspace/tb_logs" --quantization-bits $q \
+--compression-type maxmin --no-checkpoints

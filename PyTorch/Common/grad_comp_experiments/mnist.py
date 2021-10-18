@@ -1,6 +1,5 @@
 import argparse
 import os
-from filelock import FileLock
 
 import torch.multiprocessing as mp
 import torch.nn as nn
@@ -9,8 +8,13 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 import torch.utils.data.distributed
 import horovod.torch as hvd
-import compressors as compressors
-import json
+
+from gcomp_sim import DistributedOptimizer as gcomp_DistributedOptimizer
+from gcomp_sim import NoneCompressor
+
+from noise_compressor import NoiseCompressor
+
+CHECKPOINT_PATH='mnist_checkpoint.pth'
 
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
@@ -41,7 +45,9 @@ parser.add_argument('--data-dir',
 parser.add_argument("--quantization-bits", type=int, default=4,
                     help="Quantization bits (default: 4)")
 parser.add_argument("--bucket-size", type=int, default=128,
-                    help="Quantization bucket size (default: 512)")
+                    help="Quantization bucket size (default: 128)")
+parser.add_argument("--eps-noise", type=float, default=1.0,
+                    help="Distortion level")
 
 
 class Net(nn.Module):
@@ -75,8 +81,6 @@ def train(epoch):
         loss = F.nll_loss(output, target)
         loss.backward()
         optimizer.step()
-        if is_quantization_compression:
-            compression.update_metric_stats(model.parameters())
         if hvd.rank() == 0 and batch_idx % args.log_interval == 0:
             # Horovod: use train_sampler to determine the number of examples in
             # this worker's partition.
@@ -140,18 +144,17 @@ if __name__ == '__main__':
     kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
     # When supported, use 'forkserver' to spawn dataloader workers instead of 'fork' to prevent
     # issues with Infiniband implementations that are not fork-safe
-    if (kwargs.get('num_workers', 0) > 0 and hasattr(mp, '_supports_context') and
-            mp._supports_context and 'forkserver' in mp.get_all_start_methods()):
-        kwargs['multiprocessing_context'] = 'forkserver'
+    # if (kwargs.get('num_workers', 0) > 0 and hasattr(mp, '_supports_context') and
+    #         mp._supports_context and 'forkserver' in mp.get_all_start_methods()):
+    #     kwargs['multiprocessing_context'] = 'forkserver'
 
     data_dir = args.data_dir or './data'
-    with FileLock(os.path.expanduser("~/.horovod_lock")):
-        train_dataset = \
-            datasets.MNIST(data_dir, train=True, download=True,
-                           transform=transforms.Compose([
-                               transforms.ToTensor(),
-                               transforms.Normalize((0.1307,), (0.3081,))
-                           ]))
+    train_dataset = \
+        datasets.MNIST(data_dir, train=True, download=True,
+                       transform=transforms.Compose([
+                           transforms.ToTensor(),
+                           transforms.Normalize((0.1307,), (0.3081,))
+                       ]))
 
     # Horovod: use DistributedSampler to partition the training data.
     train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -171,6 +174,13 @@ if __name__ == '__main__':
                                               sampler=test_sampler, **kwargs)
 
     model = Net()
+    # model.load_state_dict(torch.load(CHECKPOINT_PATH))
+    # model.eval()
+    # for name, param in model.named_parameters():
+    #     if "fc2" not in name:
+    #         param.requires_grad = False
+    # torch.nn.init.uniform_(model.fc2.weight)
+    # torch.nn.init.zeros_(model.fc2.bias)
 
     # By default, Adasum doesn't need scaling up learning rate.
     lr_scaler = hvd.size() if not args.use_adasum else 1
@@ -191,31 +201,24 @@ if __name__ == '__main__':
     hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
     # Horovod: (optional) compression algorithm.
-    compression = compressors.MaxMinQuantizer(args.quantization_bits, args.bucket_size, False, model.named_parameters())
-    # compression = hvd.Compression.none
+    # compression = compressors.MaxMinQuantizer(args.quantization_bits, args.bucket_size, False, model.named_parameters())
+    compression = NoiseCompressor(args.eps_noise, args.bucket_size)
+    # compression = NoneCompressor()
     # Horovod: wrap optimizer with DistributedOptimizer.
-    optimizer = hvd.DistributedOptimizer(optimizer,
+    # optimizer = hvd.DistributedOptimizer(optimizer,
+    #                                      named_parameters=model.named_parameters(),
+    #                                      compression=compression,
+    #                                      op=hvd.Adasum if args.use_adasum else hvd.Average,
+    #                                      gradient_predivide_factor=args.gradient_predivide_factor)
+    optimizer = gcomp_DistributedOptimizer(optimizer,
                                          named_parameters=model.named_parameters(),
                                          compression=compression,
                                          op=hvd.Adasum if args.use_adasum else hvd.Average,
                                          gradient_predivide_factor=args.gradient_predivide_factor)
-    is_quantization_compression = issubclass(type(compression), compressors.Quantizer)
 
     for epoch in range(1, args.epochs + 1):
         train(epoch)
         test()
-        if is_quantization_compression:
-            d, sum = compression.get_metrics_magnitudes()
-            compression.adjust_bits()
-            if d:
-                if hvd.rank() == 0:
-                    directory = os.path.join("adapt-logs")
-                    os.makedirs(directory, exist_ok=True)
-                    file = "epoch_{}.json".format(epoch)
-                    with open(os.path.join(directory, file), 'w') as f:
-                        # d = {k: v / sum for k,v in d.items()}
-                        json.dump(d, f)
-                    d = compression.get_compression_scheme()
-                    file = "compress_scheme_{}.json".format(epoch)
-                    with open(os.path.join(directory, file), 'w') as f:
-                        json.dump(d, f)
+    # if hvd.rank() == 0:
+    #     torch.save(model.state_dict(), CHECKPOINT_PATH)
+    # hvd.allreduce(torch.Tensor([0.0]), name='barrier')

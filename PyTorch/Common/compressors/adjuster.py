@@ -1,8 +1,13 @@
-from bayes_optim import BO, OrdinalSpace
-from bayes_optim.Surrogate import GaussianProcess, RandomForest
-import itertools
+try:
+    # from bayes_optim import BO, OrdinalSpace
+    # from bayes_optim.Surrogate import GaussianProcess, RandomForest
+    from scipy import optimize
+    from scipy.cluster.vq import whiten, kmeans2, vq
+except Exception:
+    print("Scipy not installed")
+    pass
 import numpy as np
-from scipy import optimize
+import os
 
 class BitsAdjuster:
     def __init__(self, quantizer):
@@ -10,10 +15,10 @@ class BitsAdjuster:
         self.bits_default = quantizer.bits
         self.uncompressed_value_bits = 32
         # parameters of objective compression_ratio^alpha * error_metric^beta
-        self.alpha = 0.75
-        self.beta = 0.25
+        self.alpha = float(os.getenv("ADJUST_ALPHA", 2.0))
         self.excluded_layers = set()
         self.metric_vals_cache = {}
+        self.static_mapping = {"word_emb.emb_layers.0.weight": self.bits_default}
 
     def _reset(self):
         self.excluded_layers = set()
@@ -48,21 +53,26 @@ class BitsAdjuster:
     def fit_predict(self, states, bits_min, bits_max):
         raise NotImplementedError("fit_predict is not implemented")
 
-    def get_compression_ratio(self, states):
-        numerator = 0.
-        denominator = 0.
+    def get_compression_metric(self, states):
+        # numerator = 0.
+        # denominator = 0.
+        # for p, state in states.items():
+        #     numerator += float(state["bits"] * p.numel())
+        #     denominator += float(self.uncompressed_value_bits * p.numel())
+        # return numerator / denominator
+        levels = 0
         for p, state in states.items():
-            numerator += float(state["bits"] * p.numel())
-            denominator += float(self.uncompressed_value_bits * p.numel())
-        return numerator / denominator
+            levels += 1 << state["bits"]
+        return levels
 
     def get_objective(self, states, param_bits):
         metric_sum = 0.0
         for i, (p, state) in enumerate(states.items()):
             metric_sum += self.get_param_metric(p, state, param_bits[i])
             state["bits"] = param_bits[i]
-        ratio = self.get_compression_ratio(states)
-        return (ratio ** self.alpha) * (metric_sum ** self.beta)
+        comp_metric = self.get_compression_metric(states)
+        alpha = np.log2(self.alpha)
+        return (comp_metric ** alpha) * metric_sum
 
     def grid_search(self, states, bits_min, bits_max):
         # lists = [
@@ -92,14 +102,19 @@ class LinearAdjuster(BitsAdjuster):
     def fit_predict(self, states, bits_min, bits_max):
         self._reset()
         max_value = 0.0
+        result_bits = []
         for p in states.keys():
             value = self.quantizer.get_metric(p)
             if value == float("inf") or value != value or value < 1e-10:
                 # don't take this value into account
                 continue
             max_value = max(value, max_value)
+        if max_value < 1e-10:
+            for p, state in states.items():
+                state["bits"] = self.bits_default
+                result_bits.append(self.bits_default)
+            return result_bits
         unit = (bits_max - bits_min) / max_value
-        result_bits = []
         for p, state in states.items():
             value = self.quantizer.get_metric(p, compute=False)
             if value < 1e-10:
@@ -110,17 +125,53 @@ class LinearAdjuster(BitsAdjuster):
                 self.excluded_layers.add(p)
                 bits = self.bits_default
             else:
-                bits = int(bits_min + unit * value)
+                # bits = max(int(bits_min + unit * np.log2(value)), bits_min)
+                bits = max(int(np.ceil(bits_max + np.log2(value / max_value))), bits_min)
             state["bits"] = bits
             result_bits.append(bits)
+        return result_bits
+
+class KMeanAdjuster(BitsAdjuster):
+    def __init__(self, quantizer):
+        super(KMeanAdjuster, self).__init__(quantizer)
+
+    def fit_predict(self, states, bits_min, bits_max):
+        obs = []
+        excluded = set()
+        excluded.add("word_emb.emb_layers.0.weight")
+        for p in states.keys():
+            # obs.append((p.numel(), self.quantizer.get_metric(p)))
+            if states[p]["name"] in excluded:
+                continue
+            value = self.quantizer.get_metric(p)
+            if value == float("inf") or value != value:
+                excluded.add(states[p]["name"])
+                continue
+            obs.append((p.numel(), self.quantizer.get_metric(p)))
+            # obs.append((value,))
+        obs = np.array(obs)
+        wh_obs = whiten(obs)
+        num_clusters = bits_max - bits_min + 1
+        centroids, _ = kmeans2(wh_obs, num_clusters, iter=100, minit='++')
+        clus_ids, _ = vq(wh_obs, centroids)
+        centroids_metric = centroids[:, 1] #- centroids[:, 0]
+        codes = list(range(0, num_clusters))
+        codes = [y for x, y in sorted(zip(centroids_metric, codes))]
+        mapping = {code: bits_min + i for i, code in enumerate(codes)}
+        result_bits = []
+        count = 0
+        for p in states.keys():
+            if states[p]["name"] in excluded:
+                result_bits.append(states[p]["bits"])
+            else:
+                result_bits.append(mapping[clus_ids[count]])
+                count += 1
         return result_bits
 
 
 class BayesianAdjuster(BitsAdjuster):
     def __init__(self, quantizer):
         super(BayesianAdjuster, self).__init__(quantizer)
-        self.metric_vals = {}
-        self.excluded_layers = set()
 
     def get_bits_from_states(self, states):
         bits = []
@@ -144,8 +195,8 @@ class BayesianAdjuster(BitsAdjuster):
         # model = GaussianProcess(                # create the GPR model
         #     thetaL=thetaL, thetaU=thetaU
         # )
-        max_FEs = 2 * len(states) * (bits_max - bits_min + 1)
-
+        max_FEs = len(states) * (bits_max - bits_min + 1) / 2
+        print("Max FE", max_FEs)
         obj = obj_fun(prev_bits)
         X = [prev_bits]
         Y = [obj]
@@ -159,5 +210,49 @@ class BayesianAdjuster(BitsAdjuster):
         opt = BO(search_space, model=model, obj_fun=obj_fun, warm_data=(X, Y), max_FEs=max_FEs, verbose=False,
                  acquisition_fun='EI', minimize=True)
         xopt, fopt, stop_dict = opt.run()
-        print("Bayesian found bits: {}, best objs: {}".format(xopt, fopt))
+        # print("Bayesian found bits: {}, best objs: {}".format(xopt, fopt))
         return xopt
+
+class BestPerLayer(BitsAdjuster):
+    def __init__(self, quantizer):
+        super(BestPerLayer, self).__init__(quantizer)
+
+    def fit_predict(self, states, bits_min, bits_max):
+        opt_bits = []
+        for p, state in states.items():
+            do_print = False #state["name"] == "layers.5.dec_attn.o_net.weight" #state["name"] == 'conv1.weight' or state["name"] == 'layer2.0.downsample.0.weight'
+            best_bits = None
+            best_obj = 1e10
+            if state["name"] in self.static_mapping:
+                state["bits"] = self.static_mapping[state["name"]]
+                opt_bits.append(state["bits"])
+                continue
+            # if state["name"] not in self.static_mapping:
+            #     state["bits"] = self.bits_default
+            #     opt_bits.append(state["bits"])
+            #     continue
+            state["bits"] = 8
+            error = self.quantizer.get_metric(p, compute=True)
+            ratio = 8 / self.uncompressed_value_bits
+            alpha = 1 / np.log2(self.alpha)
+            if do_print:
+                print(state["name"])
+                # print("Alpha: ", self.alpha)
+            for b in range(bits_min, bits_max + 1):
+                ratio = b / self.uncompressed_value_bits
+                state["bits"] = b
+                error = self.quantizer.get_metric(p, compute=True)
+                if error == float("inf") or error != error:
+                    best_bits = self.bits_default
+                    break
+                reg = ratio - (4 / self.uncompressed_value_bits)
+                # obj = (ratio**self.alpha) * error # + (np.abs(reg))**(2*self.alpha) * np.sign(reg)
+                obj = b + np.log2(error) * alpha
+                if do_print:
+                    print("Bits: {}, error: {}, log err: {} ,obj: {}".format(b, error, np.log2(error) * alpha, obj))
+                if obj < best_obj:
+                    best_obj = obj
+                    best_bits = b
+            state["bits"] = best_bits
+            opt_bits.append(best_bits)
+        return opt_bits

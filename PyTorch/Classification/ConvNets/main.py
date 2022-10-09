@@ -29,7 +29,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 import os
 
-os.environ["KMP_AFFINITY"] = "disabled" # We need to do this before importing anything else as a workaround for this bug: https://github.com/pytorch/pytorch/issues/28389
+os.environ[
+    "KMP_AFFINITY"] = "disabled"  # We need to do this before importing anything else as a workaround for this bug: https://github.com/pytorch/pytorch/issues/28389
 
 import argparse
 import random
@@ -92,8 +93,8 @@ def add_parser_arguments(parser, skip_arch=False):
         default="dali-cpu",
         choices=DATA_BACKEND_CHOICES,
         help="data backend: "
-        + " | ".join(DATA_BACKEND_CHOICES)
-        + " (default: dali-cpu)",
+             + " | ".join(DATA_BACKEND_CHOICES)
+             + " (default: dali-cpu)",
     )
     parser.add_argument(
         "--interpolation",
@@ -110,8 +111,8 @@ def add_parser_arguments(parser, skip_arch=False):
             default="resnet50",
             choices=model_names,
             help="model architecture: "
-            + " | ".join(model_names)
-            + " (default: resnet50)",
+                 + " | ".join(model_names)
+                 + " (default: resnet50)",
         )
 
     parser.add_argument(
@@ -267,7 +268,7 @@ def add_parser_arguments(parser, skip_arch=False):
         "--dynamic-loss-scale",
         action="store_true",
         help="Use dynamic loss scaling.  If supplied, this argument supersedes "
-        + "--static-loss-scale.",
+             + "--static-loss-scale.",
     )
     parser.add_argument(
         "--prof", type=int, default=-1, metavar="N", help="Run only N iterations"
@@ -358,10 +359,46 @@ def add_parser_arguments(parser, skip_arch=False):
         required=False,
         choices=[am.name for am in AffinityMode],
     )
+    parser.add_argument('--dist-backend',
+                        choices=['qmpi', 'nccl', 'gloo'],
+                        default='nccl',
+                        help='Backend for torch distributed.')
+    parser.add_argument('--comp-type',
+                        choices=['none', 'qsgd', 'topk', 'psgd'],
+                        default='none',
+                        help='Type of compression.')
+    parser.add_argument(
+        "--compression-schemes",
+        default=None,
+        type=str,
+        help="directory or file where the compression schemes are hidden",
+    )
+
+    parser.add_argument(
+        "--default-comp-param",
+        type=float,
+        default=4.0,
+        help="Default Compression parameter",
+    )
+
+    parser.add_argument(
+        "--load-comp-freq",
+        type=int,
+        default=1,
+        help="Frequency of changing compression scheme",
+    )
+
 
 
 def prepare_for_training(args, model_args, model_arch):
     args.distributed = False
+    if "OMPI_COMM_WORLD_SIZE" in os.environ:
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '4040'
+        os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]
+        os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
+        os.environ["LOCAL_RANK"] = os.environ["OMPI_COMM_WORLD_LOCAL_RANK"]
+
     if "WORLD_SIZE" in os.environ:
         args.distributed = int(os.environ["WORLD_SIZE"]) > 1
         args.local_rank = int(os.environ["LOCAL_RANK"])
@@ -370,11 +407,26 @@ def prepare_for_training(args, model_args, model_arch):
 
     args.gpu = 0
     args.world_size = 1
-
+    if args.comp_type in ['qsgd', 'topk']:
+        assert args.dist_backend == 'qmpi', f"Wrong compression method for {args.dist_backend}"
+    elif args.comp_type == 'psgd':
+        assert args.dist_backend == 'nccl', f"Wrong compression method for {args.dist_backend}"
     if args.distributed:
         args.gpu = args.local_rank % torch.cuda.device_count()
         torch.cuda.set_device(args.gpu)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        if args.dist_backend == 'qmpi':
+            import torch_qmpi
+            assert "OMPI_COMM_WORLD_SIZE" in os.environ
+            if args.comp_type == "topk":
+                if 'COMPRESSION_TOPK_RATIO' not in os.environ:
+                    os.environ['COMPRESSION_TOPK_RATIO'] = str(args.default_comp_param)
+            else:
+                if 'COMPRESSION_QUANTIZATION_BITS' not in os.environ:
+                    os.environ['COMPRESSION_QUANTIZATION_BITS'] = str(int(args.default_comp_param))
+                if 'COMPRESSION_BUCKET_SIZE' not in os.environ:
+                    os.environ['COMPRESSION_BUCKET_SIZE'] = str(1024)
+
+        dist.init_process_group(backend=args.dist_backend, init_method="env://")
         args.world_size = torch.distributed.get_world_size()
 
     affinity = set_affinity(args.gpu, mode=args.gpu_affinity)
@@ -389,7 +441,7 @@ def prepare_for_training(args, model_args, model_arch):
 
         def _worker_init_fn(id):
             # Worker process should inherit its affinity from parent
-            affinity = os.sched_getaffinity(0) 
+            affinity = os.sched_getaffinity(0)
             print(f"Process {args.local_rank} Worker {id} set affinity to: {affinity}")
 
             np.random.seed(seed=args.seed + args.local_rank + id)
@@ -494,6 +546,7 @@ def prepare_for_training(args, model_args, model_arch):
         scaler=scaler,
         divide_loss=batch_size_multiplier,
         ts_script=args.jit == "script",
+        training_args=args
     )
 
     # Create data loaders and optimizers as needed
@@ -645,6 +698,7 @@ def main(args, model_args, model_arch):
         checkpoint_dir=args.workspace,
         checkpoint_filename=args.checkpoint_filename,
         keep_last_n_checkpoints=args.gather_checkpoints,
+        training_args=args
     )
     exp_duration = time.time() - exp_start_time
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:

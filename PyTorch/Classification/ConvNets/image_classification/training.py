@@ -41,7 +41,9 @@ from . import logger as log
 from . import utils
 from .logger import TrainingMetrics, ValidationMetrics
 from .models.common import EMA
-
+from .powersgd import powerSGD_hook, PowerSGDState
+from qmpi_utils import load_adapt_scheme
+import os
 
 class Executor:
     def __init__(
@@ -54,6 +56,7 @@ class Executor:
         scaler: Optional[torch.cuda.amp.GradScaler] = None,
         divide_loss: int = 1,
         ts_script: bool = False,
+        training_args=None
     ):
         assert not (amp and scaler is None), "Gradient Scaler is needed for AMP"
 
@@ -74,13 +77,25 @@ class Executor:
         self.divide_loss = divide_loss
         self._fwd_bwd = None
         self._forward = None
+        self.training_args = training_args
+        self.compression_state = None
 
     def distributed(self, gpu_id):
         self.is_distributed = True
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
+        with torch.cuda.stream(torch.cuda.current_stream()):
             self.model = DDP(self.model, device_ids=[gpu_id], output_device=gpu_id)
+
+            if self.training_args.comp_type == "psgd":
+                self.compression_state = PowerSGDState(torch.distributed.group.WORLD, int(self.training_args.default_comp_param), 10)
+                self.model.register_comm_hook(self.compression_state, powerSGD_hook)
+            elif self.training_args.dist_backend == 'qmpi':
+                pass
+                from qmpi_utils import ModelRegisterState, model_register_hook
+                self.compression_state = ModelRegisterState(torch.distributed.group.WORLD, self.model.named_parameters())
+                self.model.register_comm_hook(self.compression_state, model_register_hook)
+
         torch.cuda.current_stream().wait_stream(s)
 
     def _fwd_bwd_fn(
@@ -166,6 +181,9 @@ class Trainer:
 
     def train_step(self, input, target, step=None):
         loss = self.executor.forward_backward(input, target)
+        # for name, p in self.executor.model.named_parameters():
+        #     if torch.sum(torch.isnan(p.grad)).item() > 0:
+        #         print(f"{step}. {name}. [{torch.distributed.get_rank()}]:", torch.sum(torch.isnan(p.grad)))
 
         self.steps_since_update += 1
 
@@ -210,6 +228,8 @@ def train(
     timeout_handler,
     prof=-1,
     step=0,
+    training_args=None,
+    compression_state=None
 ):
     interrupted = False
 
@@ -239,7 +259,15 @@ def train(
             lr=lr,
             loss=reduced_loss.item(),
         )
-
+        if training_args.compression_schemes and i >= 10 and i % training_args.load_comp_freq == 0:
+            iter = (i - 10) // training_args.load_comp_freq
+            if training_args.dist_backend == 'qmpi':
+                # iter *= 4
+                iter = 80 + iter % 10
+                name_file = os.path.join(training_args.compression_schemes, f"compress_scheme_{iter}.json")
+                load_adapt_scheme(name_file, training_args.comp_type)
+            else:
+                compression_state.load_compression_scheme(training_args.compression_schemes, iter)
         end = time.time()
         if prof > 0 and (i + 1 >= prof):
             time.sleep(5)
@@ -332,6 +360,7 @@ def train_loop(
     checkpoint_dir="./",
     checkpoint_filename="checkpoint.pth.tar",
     keep_last_n_checkpoints=0,
+    training_args=None
 ):
     checkpointer = utils.Checkpointer(
         last_filename=checkpoint_filename,
@@ -372,6 +401,8 @@ def train_loop(
                     timeout_handler,
                     prof=prof,
                     step=epoch * train_loader_len,
+                    training_args=training_args,
+                    compression_state=trainer.executor.compression_state
                 )
 
             if not skip_validation:

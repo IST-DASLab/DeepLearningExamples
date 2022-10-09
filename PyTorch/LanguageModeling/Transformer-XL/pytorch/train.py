@@ -50,6 +50,8 @@ from utils.exp_utils import create_exp_dir
 from utils.exp_utils import l2_promote
 from utils.exp_utils import log_env_info
 from utils.exp_utils import register_ignoring_timeout_handler
+from utils.powersgd import powerSGD_hook, PowerSGDState
+from qmpi_utils import load_adapt_scheme
 
 
 def parse_args():
@@ -120,6 +122,32 @@ def parse_args():
                                   'socket_unique_continuous',
                                   'disabled'],
                          help='type of CPU affinity')
+    general.add_argument('--dist-backend', choices=['qmpi', 'nccl', 'gloo'], default='nccl',
+                        help='Backend for torch distributed.')
+    general.add_argument('--comp-type',
+                        choices=['none', 'qsgd', 'topk', 'psgd'],
+                        default='none',
+                        help='Type of compression.')
+    general.add_argument(
+        "--compression-schemes",
+        default=None,
+        type=str,
+        help="directory or file where the compression schemes are hidden",
+    )
+
+    general.add_argument(
+        "--default-comp-param",
+        type=float,
+        default=4.0,
+        help="Default Compression parameter",
+    )
+
+    general.add_argument(
+        "--load-comp-freq",
+        type=int,
+        default=1,
+        help="Frequency of changing compression scheme",
+    )
 
     dataset = parser.add_argument_group('dataset setup')
     dataset.add_argument('--data', type=str, default='../data/wikitext-103',
@@ -505,7 +533,7 @@ def train_iteration(model, i, mems, data_chunks, target_chunks, scaler,
 def train(tr_iter, va_iter, model, para_model, mems, model_config, optimizer,
           optimizer_sparse, scheduler, scheduler_sparse, scaler, vocab, epoch,
           last_batch, last_iter, train_step, best_val_loss, meters,
-          timeout_handler, device, args):
+          timeout_handler, device, args, compression_state):
     # Turn on training mode which enables dropout.
     model.train()
 
@@ -580,6 +608,14 @@ def train(tr_iter, va_iter, model, para_model, mems, model_config, optimizer,
             scheduler.step(train_step)
             if scheduler_sparse:
                 scheduler_sparse.step(train_step)
+
+        if args.compression_schemes and train_step >= args.load_comp_freq and train_step % args.load_comp_freq == 0:
+            iter = (train_step - args.load_comp_freq) // args.load_comp_freq + 1
+            if args.dist_backend == 'qmpi':
+                name_file = os.path.join(args.compression_schemes, f"compress_scheme_{iter}.json")
+                load_adapt_scheme(name_file, args.comp_type, 7)
+            else:
+                compression_state.load_compression_scheme(args.compression_schemes, iter)
 
         if train_step % args.log_interval == 0:
             cur_loss = train_loss / log_step
@@ -696,6 +732,19 @@ def train(tr_iter, va_iter, model, para_model, mems, model_config, optimizer,
 
 def main():
     args = parse_args()
+    if "OMPI_COMM_WORLD_SIZE" in os.environ:
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '4040'
+        os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]
+        os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
+        os.environ["LOCAL_RANK"] = os.environ["OMPI_COMM_WORLD_LOCAL_RANK"]
+
+    if "WORLD_SIZE" in os.environ:
+        args.distributed = int(os.environ["WORLD_SIZE"]) > 1
+        args.local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        args.local_rank = 0
+
     if args.affinity != 'disabled':
         nproc_per_node = torch.cuda.device_count()
         affinity = utils.gpu_affinity.set_affinity(
@@ -709,7 +758,23 @@ def main():
     torch.cuda.set_device(args.local_rank)
     l2_promote()
     device = torch.device('cuda' if args.cuda else 'cpu')
-    utils.distributed.init_distributed(args.cuda)
+    if args.comp_type in ['qsgd', 'topk']:
+        assert args.dist_backend == 'qmpi', f"Wrong compression method for {args.dist_backend}"
+    elif args.comp_type == 'psgd':
+        assert args.dist_backend == 'nccl', f"Wrong compression method for {args.dist_backend}"
+
+    if args.dist_backend == 'qmpi':
+        import torch_qmpi
+        assert "OMPI_COMM_WORLD_SIZE" in os.environ
+        if args.comp_type == "topk":
+            if 'COMPRESSION_TOPK_RATIO' not in os.environ:
+                os.environ['COMPRESSION_TOPK_RATIO'] = str(args.default_comp_param)
+        else:
+            if 'COMPRESSION_QUANTIZATION_BITS' not in os.environ:
+                os.environ['COMPRESSION_QUANTIZATION_BITS'] = str(int(args.default_comp_param))
+            if 'COMPRESSION_BUCKET_SIZE' not in os.environ:
+                os.environ['COMPRESSION_BUCKET_SIZE'] = str(512)
+    utils.distributed.init_distributed(args.cuda, args.dist_backend)
 
     args.work_dir = utils.exp_utils.build_work_dir_name(args.work_dir,
                                                         args.dataset,
@@ -897,6 +962,7 @@ def main():
                 opt_level=args.apex_amp_opt_level,
                 )
 
+    compression_state=None
     if args.multi_gpu == 'ddp' and torch.distributed.is_initialized():
         para_model = DistributedDataParallel(model,
                                              device_ids=[args.local_rank],
@@ -904,6 +970,14 @@ def main():
                                              broadcast_buffers=False,
                                              find_unused_parameters=True,
                                              )
+        if args.comp_type == "psgd":
+            compression_state = PowerSGDState(torch.distributed.group.WORLD, int(args.default_comp_param), 10)
+            para_model.register_comm_hook(compression_state, powerSGD_hook)
+        elif args.dist_backend == 'qmpi':
+            from qmpi_utils import ModelRegisterState, model_register_hook
+            compression_state = ModelRegisterState(torch.distributed.group.WORLD, model.named_parameters())
+            para_model.register_comm_hook(compression_state, model_register_hook)
+
     elif args.multi_gpu == 'dp':
         if args.gpu0_bsz >= 0:
             para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
@@ -1033,7 +1107,7 @@ def main():
                     model_config, optimizer, optimizer_sparse, scheduler,
                     scheduler_sparse, scaler, vocab, epoch, last_batch,
                     last_iter, train_step, best_val_loss, meters,
-                    timeout_handler, device, args
+                    timeout_handler, device, args, compression_state
                     )
 
                 last_batch = 0

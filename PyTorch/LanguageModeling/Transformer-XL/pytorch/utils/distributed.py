@@ -18,7 +18,7 @@ from contextlib import contextmanager
 import torch
 
 
-def init_distributed(cuda):
+def init_distributed(cuda, backend):
     """
     Initializes distributed backend.
 
@@ -28,7 +28,7 @@ def init_distributed(cuda):
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     distributed = (world_size > 1)
     if distributed:
-        backend = 'nccl' if cuda else 'gloo'
+        # backend = 'nccl' if cuda else 'gloo'
         torch.distributed.init_process_group(backend=backend,
                                              init_method='env://')
         assert torch.distributed.is_initialized()
@@ -81,14 +81,14 @@ def all_reduce_item(value, op='sum'):
             dop = torch.distributed.ReduceOp.PRODUCT
         else:
             raise RuntimeError('Unsupported reduce op')
-
-        backend = torch.distributed.get_backend()
-        if backend == torch.distributed.Backend.NCCL:
-            device = torch.device('cuda')
-        elif backend == torch.distributed.Backend.GLOO:
-            device = torch.device('cpu')
-        else:
-            raise RuntimeError('Unsupported distributed backend')
+        device = torch.device('cuda')
+        # backend = torch.distributed.get_backend()
+        # if backend == torch.distributed.Backend.NCCL:
+        #     device = torch.device('cuda')
+        # elif backend == torch.distributed.Backend.GLOO:
+        #     device = torch.device('cpu')
+        # else:
+        #     raise RuntimeError('Unsupported distributed backend')
 
         tensor = torch.tensor(value, device=device)
         torch.distributed.all_reduce(tensor, dop)

@@ -119,9 +119,9 @@ def check_socket_affinities(socket_affinities):
 def get_socket_affinities(nproc_per_node, exclude_unavailable_cores=True):
     devices = [Device(i) for i in range(nproc_per_node)]
     socket_affinities = [dev.get_cpu_affinity() for dev in devices]
-
     if exclude_unavailable_cores:
-        available_cores = os.sched_getaffinity(0)
+        available_cores = set(range(os.cpu_count()))
+        # available_cores = os.sched_getaffinity(0)
         socket_affinities = [
             list(set(affinity) & available_cores) for affinity in socket_affinities
         ]

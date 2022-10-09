@@ -15,3 +15,4 @@
 from . import distributed
 from . import exp_utils
 from . import gpu_affinity
+from . import powersgd

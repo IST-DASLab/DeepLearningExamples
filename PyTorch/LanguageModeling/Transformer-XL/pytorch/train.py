@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import yaml
+
 try:
     from apex import amp
 except ModuleNotFoundError:
@@ -51,6 +52,7 @@ from utils.exp_utils import l2_promote
 from utils.exp_utils import log_env_info
 from utils.exp_utils import register_ignoring_timeout_handler
 from utils.powersgd import powerSGD_hook, PowerSGDState
+from utils.powersgd_dp import powerSGD_hook_dp, PowerSGDStateDP
 from qmpi_utils import load_adapt_scheme
 
 
@@ -59,7 +61,7 @@ def parse_args():
         description='PyTorch Transformer-XL Language Model',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         add_help=False,
-        )
+    )
 
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
     cfg_parser = argparse.ArgumentParser(parents=[parent_parser], add_help=False)
@@ -123,11 +125,11 @@ def parse_args():
                                   'disabled'],
                          help='type of CPU affinity')
     general.add_argument('--dist-backend', choices=['qmpi', 'nccl', 'gloo'], default='nccl',
-                        help='Backend for torch distributed.')
+                         help='Backend for torch distributed.')
     general.add_argument('--comp-type',
-                        choices=['none', 'qsgd', 'topk', 'psgd'],
-                        default='none',
-                        help='Type of compression.')
+                         choices=['none', 'qsgd', 'topk', 'psgd'],
+                         default='none',
+                         help='Type of compression.')
     general.add_argument(
         "--compression-schemes",
         default=None,
@@ -179,7 +181,7 @@ def parse_args():
                        help='Apply LayerNorm to the input instead of the output')
     model.add_argument('--attn_type', type=int, default=0,
                        help='Attention type. 0 for ours, 1 for Shaw et al,'
-                       '2 for Vaswani et al, 3 for Al Rfou et al.')
+                            '2 for Vaswani et al, 3 for Al Rfou et al.')
     model.add_argument('--not_tied', action='store_true',
                        help='Do not tie the word embedding and softmax weights')
     model.add_argument('--clamp_len', type=int, default=-1,
@@ -244,7 +246,7 @@ def parse_args():
                           to local_batch_size * world_size')
     training.add_argument('--batch_chunk', type=int, default=1,
                           help='Split batch into chunks and train with '
-                          'gradient accumulation')
+                               'gradient accumulation')
     training.add_argument('--roll', action='store_true',
                           help='Enable random shifts within each data stream')
     training.add_argument('--tgt_len', type=int, default=192,
@@ -278,7 +280,7 @@ def parse_args():
                      help='Evaluation interval')
 
     dist = parser.add_argument_group('distributed setup')
-    dist.add_argument('--local_rank',  type=int,
+    dist.add_argument('--local_rank', type=int,
                       default=os.getenv('LOCAL_RANK', 0),
                       help='Used for multi-process training.')
 
@@ -310,8 +312,8 @@ def parse_args():
         raise RuntimeError('Batch size needs to be divisible by batch chunk')
 
     if (
-        args.local_batch_size is not None
-        and args.local_batch_size % args.batch_chunk != 0
+            args.local_batch_size is not None
+            and args.local_batch_size % args.batch_chunk != 0
     ):
         raise RuntimeError('Local batch size needs to be divisible by '
                            'batch chunk')
@@ -354,7 +356,7 @@ def save_checkpoint(args, model, mems, model_config, optimizer, scheduler,
         'last_iter': last_iter,
         'train_step': train_step,
         'best_val_loss': best_val_loss,
-        }
+    }
 
     last_chkpt_fname = 'checkpoint_last.pt'
 
@@ -548,7 +550,7 @@ def train(tr_iter, va_iter, model, para_model, mems, model_config, optimizer,
     else:
         train_iter = tr_iter.get_fixlen_iter(start=last_iter)
 
-    for batch, (data, target, seq_len, _) in enumerate(train_iter, start=last_batch+1):
+    for batch, (data, target, seq_len, _) in enumerate(train_iter, start=last_batch + 1):
         log_step += 1
         target_tokens += target.numel()
 
@@ -635,25 +637,25 @@ def train(tr_iter, va_iter, model, para_model, mems, model_config, optimizer,
             target_tokens = 0
 
             log_str = '| epoch {:3d} step {:>8d} | batches {:>6d} / {:d} | lr {:.3e} ' \
-                '| ms/batch {:5.1f} | tok/s {:7.0f} | loss {:5.2f}'.format(
-                    epoch,
-                    train_step,
-                    batch,
-                    tr_iter.n_batch,
-                    lr,
-                    avg_elapsed * 1000,
-                    throughput,
-                    cur_loss,
-                    )
+                      '| ms/batch {:5.1f} | tok/s {:7.0f} | loss {:5.2f}'.format(
+                epoch,
+                train_step,
+                batch,
+                tr_iter.n_batch,
+                lr,
+                avg_elapsed * 1000,
+                throughput,
+                cur_loss,
+            )
 
             dllogger_data = {
                 'epoch': epoch,
-                'train_batch': batch+1,
+                'train_batch': batch + 1,
                 'lr': lr,
                 'train_time/batch': avg_elapsed * 1000,
                 'train_throughput': throughput,
                 'train_loss': cur_loss,
-                }
+            }
 
             if args.dataset in ['enwik8', 'text8']:
                 log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
@@ -677,16 +679,16 @@ def train(tr_iter, va_iter, model, para_model, mems, model_config, optimizer,
             logging.info('-' * 100)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
                       '| valid loss {:5.2f}'.format(
-                          train_step // args.eval_interval,
-                          train_step,
-                          (time.time() - eval_start_time),
-                          val_loss,
-                          )
+                train_step // args.eval_interval,
+                train_step,
+                (time.time() - eval_start_time),
+                val_loss,
+            )
 
             dllogger_data = {
                 'valid_elapsed': (time.time() - eval_start_time),
                 'valid_loss': val_loss,
-                }
+            }
 
             if args.dataset in ['enwik8', 'text8']:
                 log_str += ' | bpc {:9.5f}'.format(val_loss / math.log(2))
@@ -896,7 +898,7 @@ def main():
         'attn_type': args.attn_type,
         'clamp_len': args.clamp_len,
         'sample_softmax': args.sample_softmax,
-        }
+    }
 
     model = MemTransformerLM(**model_config)
 
@@ -960,9 +962,9 @@ def main():
                 model,
                 optimizer,
                 opt_level=args.apex_amp_opt_level,
-                )
+            )
 
-    compression_state=None
+    compression_state = None
     if args.multi_gpu == 'ddp' and torch.distributed.is_initialized():
         para_model = DistributedDataParallel(model,
                                              device_ids=[args.local_rank],
@@ -971,7 +973,20 @@ def main():
                                              find_unused_parameters=True,
                                              )
         if args.comp_type == "psgd":
-            compression_state = PowerSGDState(torch.distributed.group.WORLD, int(args.default_comp_param), 10)
+            # compression_state = PowerSGDState(torch.distributed.group.WORLD, int(args.default_comp_param), 10)
+            min_compression_rate = 2
+            adjust_gamma = 0.5
+            adjust_beta = 2
+            adjust_alpha = 1
+            use_error_feedback = True
+            warm_start = True
+            compression_state = PowerSGDStateDP(torch.distributed.group.WORLD,
+                                                matrix_approximation_rank=int(args.default_comp_param), warm_start=warm_start,
+                                                start_powerSGD_iter=100,
+                                                use_error_feedback=use_error_feedback,
+                                                min_compression_rate=min_compression_rate,
+                                                adjust_freq=2000,
+                                                adjust_alpha=adjust_alpha, adjust_beta=adjust_beta, adjust_gamma=adjust_gamma)
             para_model.register_comm_hook(compression_state, powerSGD_hook)
         elif args.dist_backend == 'qmpi':
             from qmpi_utils import ModelRegisterState, model_register_hook
@@ -1011,24 +1026,25 @@ def main():
             else:
                 return 1. / (step ** 0.5) if step > args.warmup_step \
                     else step / (args.warmup_step ** 1.5)
+
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         if args.sample_softmax > 0 and optimizer_sparse is not None:
             scheduler_sparse = optim.lr_scheduler.LambdaLR(
                 optimizer_sparse,
                 lr_lambda=lr_lambda
-                )
+            )
         else:
             scheduler_sparse = None
     elif args.scheduler == 'dev_perf':
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, factor=args.decay_rate, patience=args.patience,
             min_lr=args.lr_min,
-            )
+        )
         if args.sample_softmax > 0 and optimizer_sparse is not None:
             scheduler_sparse = optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer_sparse, factor=args.decay_rate, patience=args.patience,
                 min_lr=args.lr_min,
-                )
+            )
         else:
             scheduler_sparse = None
     elif args.scheduler == 'constant':
@@ -1108,7 +1124,7 @@ def main():
                     scheduler_sparse, scaler, vocab, epoch, last_batch,
                     last_iter, train_step, best_val_loss, meters,
                     timeout_handler, device, args, compression_state
-                    )
+                )
 
                 last_batch = 0
                 last_iter = 0
@@ -1128,10 +1144,10 @@ def main():
     summary = {}
     test_path = os.path.join(args.work_dir, 'checkpoint_best.pt')
     if (
-        not args.debug
-        and not args.no_test
-        and not args.no_eval
-        and os.path.exists(test_path)
+            not args.debug
+            and not args.no_test
+            and not args.no_eval
+            and os.path.exists(test_path)
     ):
         # Load the best saved model.
         checkpoint = load_checkpoint(test_path)
@@ -1155,7 +1171,7 @@ def main():
         summary.update({
             'test_elapsed': test_elapsed,
             'test_loss': test_loss,
-            })
+        })
 
         if args.dataset in ['enwik8', 'text8']:
             summary['test_bits_per_character'] = test_loss / math.log(2)
@@ -1176,7 +1192,7 @@ def main():
         'train_loss': cur_loss,
         'valid_loss': best_val_loss,
         'valid_perplexity': best_val_perplexity,
-        })
+    })
     dllogger.log(step=tuple(), data=summary)
 
     passed = benchmark(
@@ -1184,7 +1200,7 @@ def main():
         test_perplexity=best_val_perplexity,
         target_throughput=args.target_throughput,
         test_throughput=meters['train_throughput'].avg
-        )
+    )
     if not passed:
         sys.exit(1)
 

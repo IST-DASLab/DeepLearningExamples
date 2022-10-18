@@ -6,7 +6,6 @@ import torch
 import torch.distributed as dist
 
 from . import default_hooks as default
-import ast
 
 __all__ = [
     "PowerSGDState", "powerSGD_hook", "batched_powerSGD_hook"
@@ -106,7 +105,7 @@ def _report_compression_stats(bucket, state):
         state.next_stats_report = state.iter + state.compression_stats_logging_frequency
 
 
-class PowerSGDState(object):
+class PowerSGDStateDP(object):
     r"""
     Stores both the algorithm's hyperparameters and the internal state for all the gradients during the training.
     Particularly, ``matrix_approximation_rank`` and ``start_powerSGD_iter`` are the main hyperparameters that should be tuned by the user.
@@ -167,8 +166,7 @@ class PowerSGDState(object):
         "error_method",
         "error_method_iter",
         "acc_iter",
-        "loaded_compress_params",
-        "need_reallocate"
+        "bucket_num"
     ]
 
     def __init__(
@@ -266,10 +264,7 @@ class PowerSGDState(object):
         )
         self.next_stats_report = 0
         # Adjuster Parameters Initialization
-        self.loaded_compress_params = []
-        self.opt_compress_param = None
-        #[[1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]
-
+        self.opt_compress_param = []
         self.tensors_shape_n = []
         self.tensors_shape_m = []
         self.acc_grad = []
@@ -286,7 +281,7 @@ class PowerSGDState(object):
         self.error_method = error_method
         self.error_method_iter = error_method_iter
         self.acc_iter = 10
-        self.need_reallocate = False
+        self.bucket_num = []
 
     def maybe_increase_iter(self, bucket):
         # Since bucket 0 is the last bucket to allreduce in an iteration.
@@ -299,21 +294,6 @@ class PowerSGDState(object):
             logger.info(
                 "Start to apply PowerSGD after {} iterations.".format(self.iter)
             )
-
-    def load_compression_scheme(self, file, iter):
-        if not self.loaded_compress_params:
-            with open(file, 'r') as f:
-                while True:
-                    line = f.readline()
-                    if not line:
-                        break
-                    idx = line.find('[')
-                    line = line[idx:]
-                    self.loaded_compress_params.append(ast.literal_eval(line))
-        self.opt_compress_param = self.loaded_compress_params[iter]
-        self.need_reallocate = True
-
-
 
     def compression_stats(self):
         r"""
@@ -335,7 +315,7 @@ class PowerSGDState(object):
         )
 
 
-def powerSGD_hook(
+def powerSGD_hook_DP(
         state: PowerSGDState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
     r"""
@@ -421,29 +401,19 @@ def powerSGD_hook(
     tensors_to_compress, uncompressed_tensors = [], []
     total_Ps_size = 0
     total_Qs_size = 0
-    i = 0
     for tensor in tensors:
         matrix = tensor.view(tensor.shape[0], -1)
         n, m = matrix.shape
-        if state.opt_compress_param:
-            if i < len(state.opt_compress_param[bucket_index]):
-                matrix_approximation_rank = min(n, m, state.opt_compress_param[bucket_index][i])
-            else:
-                # force no compression
-                matrix_approximation_rank = max(n, m)
-        else:
-            matrix_approximation_rank = min(n, m, state.matrix_approximation_rank)
-
+        matrix_approximation_rank = min(n, m, state.matrix_approximation_rank)
         compress_test = _should_compress(
             n, m, matrix_approximation_rank, state.min_compression_rate
         )
         state.total_numel_before_compression += compress_test[1]
         if compress_test[0]:
             tensors_to_compress.append(matrix)
-            i += 1
             total_Ps_size += n * matrix_approximation_rank
             total_Qs_size += m * matrix_approximation_rank
-            state.total_numel_after_compression += (n+m)*matrix_approximation_rank
+            state.total_numel_after_compression += compress_test[2]
         else:
             uncompressed_tensors.append(tensor)
             state.total_numel_after_compression += compress_test[1]
@@ -463,25 +433,236 @@ def powerSGD_hook(
     # If warm-start is enabled, reuse Ps and Qs from the previous iteration if possible.
     # The memory spaces of Ps and Qs need to be allocated in the first iteration when PowerSGD is applied.
     need_randomize_qs = False
-    if not state.warm_start or bucket_index not in state.p_memory_dict or state.need_reallocate:
+    if not state.warm_start or bucket_index not in state.p_memory_dict:
         need_randomize_qs = True
         # If warm-start is disabled, low-rank tensors will be initialized at every step.
         # Only log this if warm-start to avoid spamming.
-        # if state.warm_start or state.need_reallocate:
-        #     logger.info(
-        #         "Allocating contiguous memory of length {} for Ps, and of length {} for Qs, respectively.".format(
-        #             total_Ps_size, total_Qs_size
-        #         )
-        #     )
+        if state.warm_start:
+            logger.info(
+                "Allocating contiguous memory of length {} for Ps, and of length {} for Qs, respectively.".format(
+                    total_Ps_size, total_Qs_size
+                )
+            )
         state.p_memory_dict[bucket_index] = torch.empty(
             total_Ps_size, device=device, dtype=dtype
         )
         state.q_memory_dict[bucket_index] = torch.empty(
             total_Qs_size, device=device, dtype=dtype
         )
-        if bucket.is_last():
-            state.need_reallocate = False
 
+    # DP adjuster
+    # Accumulate Gradients
+    if dist.get_rank() == 0:
+        if state.iter_rel % state.adjust_freq == 0 and bucket_index == 0:
+            state.tensors_to_adjust = []
+            bucket_idx = 0
+            state.bucket_num = []
+            for bucket_state in state.acc_grad:
+                for layer_idx in range(len(bucket_state)):
+                    state.tensors_to_adjust.append(state.acc_grad[bucket_idx][layer_idx])
+                    state.bucket_num.append(bucket_idx + 1)
+                bucket_idx += 1
+            state.acc_grad = []
+
+        if state.iter_rel % state.adjust_freq >= state.adjust_freq - state.acc_iter:
+
+            if len(state.acc_grad) <= bucket_index:
+                state.acc_grad.append([])
+
+            i = 0
+            for tensor in tensors_to_compress:
+                tensor_n = torch.mul(tensor, state.delta / state.acc_iter)
+                if len(state.acc_grad[bucket_index]) > i:
+                    torch.add(state.acc_grad[bucket_index][i], tensor_n, out=state.acc_grad[bucket_index][i])
+                else:
+                    state.acc_grad[bucket_index].append(tensor_n)
+                i += 1
+
+    # Initialize opt_compress_param and tensors_shapes
+    if state.iter_rel == 0:
+        opt_compress_param = []
+        tensors_shape_n = []
+        tensors_shape_m = []
+
+        for tensor in tensors_to_compress:
+            opt_compress_param.append(state.matrix_approximation_rank)
+            n, m = tensor.shape
+            tensors_shape_n.append(n)
+            tensors_shape_m.append(m)
+
+        state.opt_compress_param.append(opt_compress_param)
+        state.tensors_shape_n.append(tensors_shape_n)
+        state.tensors_shape_m.append(tensors_shape_m)
+
+        if dist.get_rank() == 0:
+            print("Ns: ", tensors_shape_n)
+            print("Ms: ", tensors_shape_m)
+
+    # DP Algorithm
+    DPBUCKETS = 10000
+
+    if state.iter_rel % state.adjust_freq == 0 and dist.get_rank() == 0 and bucket_index == 0 and state.iter_rel > 0:
+        tensors_to_adjust = state.tensors_to_adjust
+        # Build the Error Table using torch.svdvals()
+        rank_range = state.rank_range
+        min_rank = state.min_rank
+        max_rank = state.max_rank
+
+        num_layers = len(tensors_to_adjust)
+        compression_errors = np.zeros([num_layers, rank_range])
+        compressed_sizes = np.zeros([num_layers, rank_range])
+
+        i = 0
+        for tensor in tensors_to_adjust:
+            n, m = tensor.shape
+            r = min(n, m, max_rank)
+            compressed_sizes[i, :r - min_rank + 1] = np.arange(min_rank, r + 1) * (n + m) * 0.5 * state.bucket_num[i]
+            # why "+1"? so that the algorithm returns the true rank!
+            compressed_sizes[i, r - min_rank + 1:] = (r * (n + m) + 1) * 0.5 * state.bucket_num[i]
+
+            # Vectorized Implementation of SVD
+            if state.error_method == 'SVD':
+                s = torch.linalg.svdvals(tensor)
+                ss = torch.square(s)
+                ut = torch.triu(torch.full((r, min(n, m)), 1.0, device='cuda'), diagonal=1)
+                compression_errors[i, :] = torch.sqrt(torch.matmul(ut, torch.t(ss))).cpu()[min_rank - 1:r]
+
+            if state.error_method == 'Power':
+                for r in range(min_rank, min(n, m, max_rank) + 1):
+                    q = torch.randn(m, r, device='cuda')
+                    p = torch.empty(n, r, device='cuda')
+                    for k in range(state.error_method_iter):
+                        _orthogonalize(q)
+                        torch.matmul(tensor, q, out=p)
+                        _orthogonalize(p)
+                        torch.matmul(tensor.t(), p, out=q)
+                    t = torch.empty(n, m, device='cuda')
+                    torch.matmul(p, q.t(), out=t)
+                    compression_errors[i, r - min_rank] = torch.dist(t, tensor)
+            i += 1
+
+        ## Discretize the Error Table
+        static_error = np.sum(compression_errors[:, state.matrix_approximation_rank - state.min_rank])
+        target_score = state.alpha * static_error
+
+        ## Fixing the NaN Problem;
+        compression_errors = np.minimum(compression_errors, target_score + 1)
+        np.nan_to_num(compression_errors, nan=target_score + 1)
+
+        bucket_size = target_score / DPBUCKETS
+        compression_errors = np.minimum(np.maximum(np.ceil(compression_errors / bucket_size), 1), DPBUCKETS)
+
+        np.nan_to_num(compression_errors, nan=DPBUCKETS + 1)
+        compression_errors = compression_errors.astype(int)
+
+        # Fill the DP table
+        num_buckets = DPBUCKETS + 1
+        num_values = state.rank_range
+
+        DP = np.full((num_layers, DPBUCKETS + 1), float('inf'))
+        PD = np.full((num_layers, DPBUCKETS + 1), -1)
+
+        # Initialize the Table for the First Layer
+        for bucket_idx in range(num_buckets):
+            for val_idx in range(num_values):
+                if bucket_idx > compression_errors[0, val_idx]:
+                    tmp = compressed_sizes[0, val_idx]
+                    if DP[0, bucket_idx] > tmp:
+                        PD[0, bucket_idx] = val_idx
+                        DP[0, bucket_idx] = tmp
+
+        # Fill the Rest Recursively
+        # Vectorized Implementation
+        for layer_idx in range(1, len(DP)):
+            for val_idx in range(num_values):
+                comp_size = compressed_sizes[layer_idx][val_idx]
+                comp_error = compression_errors[layer_idx][val_idx]
+                tmp = DP[layer_idx - 1][:-comp_error] + comp_size
+                better = tmp < DP[layer_idx][comp_error:]
+                if np.sum(better):
+                    DP[layer_idx][comp_error:][better] = tmp[better]
+                    PD[layer_idx][comp_error:][better] = val_idx
+
+        # Finding the Optimal Compression Scheme
+        opt_compression_error = np.argmin(DP[-1, :])
+        total_error = opt_compression_error
+
+        if total_error <= DPBUCKETS:
+            opt_compress_param = []
+            # Build the Solution from the Table
+            for layer_idx in range(len(DP) - 1, -1, -1):
+                opt_compress_param.append(PD[layer_idx][total_error] + state.min_rank)
+                total_error -= compression_errors[layer_idx, PD[layer_idx][total_error]]
+            opt_compress_param.reverse()
+
+            # Save the Optimal Compression Scheme into the State
+            i = 0
+            j = 0
+            for bucket_state in state.opt_compress_param:
+                for layer_idx in range(len(bucket_state)):
+                    state.opt_compress_param[i][layer_idx] = opt_compress_param[j]
+                    j += 1
+                i += 1
+
+        print("optimal compression parameters = ", state.opt_compress_param)
+
+    if state.iter_rel % state.adjust_freq == 0 and bucket_index == 0 and state.iter_rel > 0:
+        # Broadcast the Optimal Compression to All Workers
+        dist.broadcast_object_list(state.opt_compress_param, src=0)
+
+        # Recalculate Size of Ps and Qs
+        bucket_idx = 0
+        for bucket_state in state.opt_compress_param:
+            total_Ps_size = 0
+            total_Qs_size = 0
+            for layer_idx in range(len(bucket_state)):
+                n = state.tensors_shape_n[bucket_idx][layer_idx]
+                m = state.tensors_shape_m[bucket_idx][layer_idx]
+                matrix_approximation_rank = min(n, m, state.opt_compress_param[bucket_idx][layer_idx])
+                total_Ps_size += n * matrix_approximation_rank
+                total_Qs_size += m * matrix_approximation_rank
+
+            # Reinitialize Ps and Qs with Correct Shapes!
+            state.p_memory_dict[bucket_idx] = torch.empty(
+                total_Ps_size, device=device, dtype=dtype
+            )
+
+            state.q_memory_dict[bucket_idx] = torch.randn(
+                total_Qs_size, device=device, dtype=dtype
+            )
+
+            bucket_idx += 1
+
+            # applying few warmup power step for all workers
+            if state.warmup_after_adjusting:
+                ps = []
+                qs = []
+                p_idx = 0
+                q_idx = 0
+                for layer_idx in range(len(tensors_to_compress)):
+                    n = state.tensors_shape_n[bucket_index][layer_idx]
+                    m = state.tensors_shape_m[bucket_index][layer_idx]
+                    matrix_approximation_rank = min(n, m, state.opt_compress_param[bucket_index][layer_idx])
+                    ps.append(
+                        state.p_memory_dict[bucket_index][
+                        p_idx: p_idx + n * matrix_approximation_rank
+                        ].view(n, matrix_approximation_rank)
+                    )
+                    qs.append(
+                        state.q_memory_dict[bucket_index][
+                        q_idx: q_idx + m * matrix_approximation_rank
+                        ].view(m, matrix_approximation_rank)
+                    )
+                    p_idx += n * matrix_approximation_rank
+                    q_idx += m * matrix_approximation_rank
+                    layer_idx += 1
+
+                for tensor, q, p in zip(tensors_to_compress, qs, ps):
+                    for k in range(state.error_method_iter):
+                        _orthogonalize(q)
+                        torch.matmul(tensor, q, out=p)
+                        _orthogonalize(p)
+                        torch.matmul(tensor.t(), p, out=q)
 
     # Create Ps and Qs that point to the allocated memory.
     ps = []
@@ -493,12 +674,10 @@ def powerSGD_hook(
     i = 0
     for tensor in tensors_to_compress:
         n, m = tensor.shape
-        if state.opt_compress_param:
-            matrix_approximation_rank = state.opt_compress_param[bucket_index][i]
-        else:
-            matrix_approximation_rank = state.matrix_approximation_rank
+        matrix_approximation_rank = state.opt_compress_param[bucket_index][i]
         matrix_approximation_rank = min(n, m, matrix_approximation_rank)
         i += 1
+
         ps.append(
             state.p_memory_dict[bucket_index][
             p_idx: p_idx + n * matrix_approximation_rank
